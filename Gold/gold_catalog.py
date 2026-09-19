@@ -2,39 +2,17 @@
 # Databricks notebook source
 # Gold field catalog builder
 # ─────────────────────────────────────────────────────────────────────────────
-"""
-Build the field catalog from gold metadata (the authored `catalog` block on each
-table) and emit it as catalog.json alongside the gold tables.
+"""Generate a client-specific v2 catalog from merged gold configuration.
 
-The catalog is AUTHORED in gold_tables.json -- each table's `catalog.fields`
-declares label + dataType per output column, and `catalog.hidden` lists columns
-to omit. This module turns that into the final catalog the report editor consumes,
-deriving the mechanical parts (which aggregations are valid, groupability, date
-transforms) from dataType so they don't have to be hand-declared.
-
-INSPECT MODE: each field carries a small `provenance` OBJECT so inspect mode can
-explain it. The catalog stores only the minimal REFERENCES; all explanation prose
-lives frontend-side (RESOLUTION_PROSE / METRIC_PROSE / etc.), keyed by these refs:
-
-    provenance = {
-      "type":     "native" | "resolved" | "metric" | "derived",   # always
-      "strategy": "<resolve strategy name>",   # resolved fields only
-      "agg":      "<metric agg>",              # metric fields only (its defining agg)
-      "expr":     "<derive expr>",             # derived fields only
-    }
-
-Authored per field in the catalog block as:
-    "sales_rep_e_email": { "label": "...", "dataType": "string",
-                           "provenance": "resolved",
-                           "strategy": "sales_rep_native_then_company_owner" }
-`provenance` defaults to "native" when omitted (a raw source column).
-
-This replaces the API's DESCRIBE + type-inference approach: types are declared
-where the columns are born (gold), not guessed downstream. The catalog travels
-with the data (written to the gold container) and refreshes on the same pipeline
-run.
+Output: {schema_version, run_id, tables, strategies}. English descriptions live
+with strategy decorators, not in this module or in frontend business dictionaries.
+Only used strategies are published, once per client. Field provenance is derived
+from the actual merged resolver/metric/enrich/derive configuration, including
+platform overrides. Evidence columns are explicitly mapped per output field.
+The authored catalog still controls labels, data types and editor visibility.
 """
 import json
+import copy
 
 # semantic dataType -> (valid aggregations, groupable). Derived, not authored.
 _AGG_RULES = {
@@ -102,12 +80,59 @@ def build_table_catalog(table_name: str, table_meta: dict) -> dict:
     return {"table": table_name, "fields": fields}
 
 
-def build_full_catalog(tables_meta: dict) -> dict:
+def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, run_id=None) -> dict:
     """Catalog for every EXPORTED table (export != false), keyed by table name.
 
     Only exported tables get a catalog -- internal dims (export:false) aren't
     queryable, so they don't belong in the editor's vocabulary.
     """
+    # Definitions are passed from the same registry that executes the strategies.
+    # Never infer the applied strategy from the authored catalog prose.
+    strategies = strategies if strategies is not None else globals().get("STRATEGY_DEFINITIONS", {})
+    used = set()
+
+    def reference(stage, name):
+        matches = [k for k, v in strategies.items() if v["stage"] == stage and v["name"] == name]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one active definition for {stage}.{name}")
+        used.add(matches[0])
+        return matches[0]
+
+    def field_provenance(table, key, trail=()):
+        if (table, key) in trail:
+            raise ValueError(f"Cyclic field provenance: {table}.{key}")
+        tm = tables_meta[table]
+        refs, definition = [], {}
+        if key in tm.get("resolve", {}):
+            spec = tm["resolve"][key]
+            default = reference("resolve", spec["strategy"])
+            overrides = {p: reference("resolve", s) for p, s in spec.get("by_platform", {}).items()}
+            refs = list(dict.fromkeys([default, *overrides.values()]))
+            definition = {"type": "resolved", "strategy": spec["strategy"],
+                          "default_strategy": default, "by_platform": overrides}
+        else:
+            for stage, section, op in [("metric", "metrics", "agg"), ("derive", "derive", "expr")]:
+                spec = next((s for s in tm.get(section, []) if s["name"] == key), None)
+                if spec:
+                    refs = [reference(stage, spec[op])]
+                    definition = {"type": "metric" if stage == "metric" else "derived",
+                                  op: spec[op], "calculation": copy.deepcopy(spec)}
+                    break
+            if not refs:
+                for spec in tm.get("enrich", []):
+                    source = next((s for s, t in spec.get("bring", {}).items() if t == key), None)
+                    if source is not None:
+                        origin = field_provenance(spec["from"], source, (*trail, (table, key)))
+                        refs = [reference("enrich", spec.get("strategy", "left_join_bring"))]
+                        definition = {"type": "enriched", "origin": {"table": spec["from"],
+                            "field": source, "provenance": origin}, "join": {"on": spec["on"],
+                            "source_on": spec.get("source_on", spec["on"])}}
+                        break
+        if not refs:
+            return {"type": "native"}
+        return {**definition, "strategies": refs,
+                "evidence": {"source_column": key + "_source", "column": key + "_evidence"}}
+
     out = {}
     for name, meta in tables_meta.items():
         if name.startswith("_") or not isinstance(meta, dict):
@@ -116,14 +141,59 @@ def build_full_catalog(tables_meta: dict) -> dict:
             continue
         if "catalog" not in meta:
             continue
-        out[name] = build_table_catalog(name, meta)
-    return out
+        cat = build_table_catalog(name, meta)
+        for field in cat["fields"]:
+            field["provenance"] = field_provenance(name, field["key"])
+        entity = meta.get("entity", name)
+        def native(key):
+            if key in meta.get("system_columns", ["source_platform"]) or "_e_" in key:
+                return key
+            return f"{entity}_e_{'id' if key == meta.get('grain_pk') else meta.get('source', {}).get('carried_keys', {}).get(key, key)}"
+        identities = list(dict.fromkeys([native(k) for k in [meta.get("grain_pk"), *meta.get("own_keys", [])] if k]
+                         + meta.get("system_columns", ["source_platform"])))
+        actual = set(schema_columns[name]) if schema_columns and name in schema_columns else None
+        fields = [f["key"] for f in cat["fields"]]
+        # Identity columns can be queried for drilldown even when hidden from editors.
+        allowed = list(dict.fromkeys(fields + identities))
+        if actual is not None:
+            allowed = [k for k in allowed if k in actual]
+            identities = [k for k in identities if k in actual]
+            for field in cat["fields"]:
+                evidence = field["provenance"].get("evidence")
+                if evidence and not {evidence["column"], evidence["source_column"]} <= actual:
+                    raise ValueError(f"Missing generated evidence for {name}.{field['key']}")
+        cat["record_identity"] = identities
+        cat["record_grain"] = meta.get("source", {}).get("grain", name)
+        cat["evidence_query_fields"] = allowed
+        cat["record_fields"] = allowed
+        dedup = meta.get("dedup")
+        if dedup:
+            cat["row_provenance"] = {"strategies": [reference("dedup", dedup.get("strategy", "keep_first"))],
+                "evidence": {"source_column": "__mm_dedup_source", "column": "__mm_dedup_evidence"}}
+        out[name] = cat
+    # Include all strategies actually configured, including non-exported stages,
+    # once per client. Unused registered strategies are not published.
+    for tm in tables_meta.values():
+        if not isinstance(tm, dict):
+            continue
+        for spec in tm.get("resolve", {}).values():
+            for s in [spec["strategy"], *spec.get("by_platform", {}).values()]:
+                reference("resolve", s)
+        for stage, section, op in [("metric", "metrics", "agg"), ("derive", "derive", "expr")]:
+            for spec in tm.get(section, []):
+                reference(stage, spec[op])
+        for spec in tm.get("enrich", []):
+            reference("enrich", spec.get("strategy", "left_join_bring"))
+        if tm.get("dedup"):
+            reference("dedup", tm["dedup"].get("strategy", "keep_first"))
+    return {"schema_version": 2, "run_id": run_id, "tables": out,
+            "strategies": {k: copy.deepcopy(strategies[k]) for k in sorted(used)}}
 
 
-def write_catalog(tables_meta: dict, out_path: str):
+def write_catalog(tables_meta: dict, out_path: str, **kwargs):
     """Build the full catalog and write it as JSON to out_path (e.g. an ADLS
     path in the gold container). Called by gold_build after tables are written."""
-    catalog = build_full_catalog(tables_meta)
+    catalog = build_full_catalog(tables_meta, **kwargs)
     payload = json.dumps(catalog, indent=2)
     # dbutils is available in Databricks; fall back to open() elsewhere (tests).
     try:
@@ -131,5 +201,5 @@ def write_catalog(tables_meta: dict, out_path: str):
     except NameError:
         with open(out_path, "w") as f:
             f.write(payload)
-    print(f"✓ catalog.json written ({len(catalog)} tables) -> {out_path}")
+    print(f"✓ catalog.json written ({len(catalog['tables'])} tables) -> {out_path}")
     return catalog
