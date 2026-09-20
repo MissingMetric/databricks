@@ -1,0 +1,106 @@
+{
+  "_comment": "The common data model, keyed by TABLE. Each table is the column contract every platform's conformed output for that table must satisfy EXACTLY. The validator (check #2) looks up common_model.tables[entity.table] and asserts the entity produces precisely these columns. This protects the per-table UNION ALL that feeds gold. `table` (which contract) is a SEPARATE axis from `shape` (how rows are extracted). SILVER carries raw identifiers (owner_id, company strings) and does NO cross-entity or cross-source joins; identity resolution (owner_id->rep_email, company-string->HubSpot match, rep attribution) is the GOLD resolve step, which assembles all sources first. NAMING: columns are BARE (no entity prefix). The GOLD engine constructs <entity>_e_<field> names at build time from gold metadata (grain_pk -> _e_id, carried_keys -> _e_<key>, native -> _e_<bare>). Keep bare names distinct within a table by design; the model author avoids collisions.",
+  "tables": {
+    "order": {
+      "_comment": "Order header. One row per order. shape 'object'. Cin7 + Shopify. cogs_generated_date (Cin7 ModifiedCOGSDate) signals whether line unit_cost is trustworthy transaction cost vs null. BARE: order_id->id, order_reference->reference, order_date->date, order_source->source. customer_*/billing_*/sales_rep_email kept (order-origin signals). GOLD: grain_pk=id.",
+      "columns": {
+        "id": "string",
+        "reference": "string",
+        "source_platform": "string",
+        "date": "timestamp",
+        "created_date": "timestamp",
+        "modified_date": "timestamp",
+        "subtotal": "double",
+        "freight": "double",
+        "discount_total": "double",
+        "revenue": "double",
+        "currency": "string",
+        "customer_email": "string",
+        "customer_company": "string",
+        "customer_first_name": "string",
+        "customer_last_name": "string",
+        "billing_city": "string",
+        "billing_state": "string",
+        "billing_country": "string",
+        "sales_rep_email": "string",
+        "status": "string",
+        "stage": "string",
+        "source": "string",
+        "cogs_generated_date": "timestamp"
+      }
+    },
+    "order_line": {
+      "_comment": "Order line. One row per line item. FK order_id -> order. shape 'nested_array'. unit_cost is the LINE-LEVEL transaction cost (Cin7 SalesOrderItem.unitCost, populated only after COGS generates; null for Shopify lines -- Shopify cost lives on the product). GOLD margin resolver uses this as tier-1 cost, falling back to product catalog cost. BARE: order_line_id->id. order_id (FK->order) kept. product_sku (FK->product) kept. product_name kept (line-origin descriptor, distinct from product.name). GOLD: grain of the orders fact; grain_pk=id, carried_keys order_id->order_id.",
+      "columns": {
+        "id": "string",
+        "order_id": "string",
+        "source_platform": "string",
+        "product_sku": "string",
+        "product_name": "string",
+        "variant": "string",
+        "quantity": "double",
+        "unit_price": "double",
+        "line_discount_pct": "double",
+        "line_revenue": "double",
+        "unit_cost": "double"
+      }
+    },
+    "sales_rep": {
+      "_comment": "Sales rep / owner dimension. One row per rep. shape 'object'. HubSpot owners; rep_email is the unified identity that matches Cin7 salesPersonEmail (matched in GOLD, not here). BARE: rep_id->id, rep_email->email, rep_name->name. GOLD: grain_pk=id -> sales_rep_e_id; email->sales_rep_e_email (the unified rep identity).",
+      "columns": {
+        "id": "string",
+        "email": "string",
+        "name": "string",
+        "source_platform": "string",
+        "created_date": "timestamp",
+        "modified_date": "timestamp"
+      }
+    },
+    "company": {
+      "_comment": "Company dimension. One row per business. shape 'object'. Carries raw owner_id (NOT owner_email) and a primary_contact_id plucked from the association array; GOLD resolves owner_id->rep_email and company-string->this table. BARE: company_id->id, company_name->name. owner_id (raw FK->sales_rep) + primary_contact_id (FK->contact) kept. GOLD: grain_pk=id; owner_id resolves to sales_rep_e_email.",
+      "columns": {
+        "id": "string",
+        "name": "string",
+        "owner_id": "string",
+        "primary_contact_id": "string",
+        "source_platform": "string",
+        "created_date": "timestamp",
+        "modified_date": "timestamp"
+      }
+    },
+    "contact": {
+      "_comment": "Contact dimension. One row per person. shape 'object'. Nullable company_id FK (1 company : N contacts) plucked from the association array. Carries raw owner_id; GOLD resolves owner_id->rep_email. BARE: contact_id->id. email/first_name/last_name bare. company_id (FK->company) + owner_id (FK->sales_rep) kept. GOLD: grain_pk=id.",
+      "columns": {
+        "id": "string",
+        "email": "string",
+        "first_name": "string",
+        "last_name": "string",
+        "company_id": "string",
+        "owner_id": "string",
+        "source_platform": "string",
+        "created_date": "timestamp",
+        "modified_date": "timestamp"
+      }
+    },
+    "product": {
+      "_comment": "Product dimension at VARIANT/OPTION grain -- one row per sellable SKU. Shopify explodes variants, Cin7 explodes productOptions; both key on product_sku. Cin7 (ERP) fills supply-side fields Shopify lacks (unit_cost, wholesale_price); Shopify fills sell-side truth (retail_price, published status). GOLD dedups the same SKU across platforms with PER-FIELD authority, not blanket source-priority. BARE: product_sku->sku (the variant grain key), product_id->id (parent product id), product_name->name. GOLD: grain_pk=sku -> product_e_sku? NOTE: grain key is sku not id; declare grain_pk=sku, and gold emits product_e_sku as the identity (not product_e_id). variant_id kept.",
+      "columns": {
+        "sku": "string",
+        "id": "string",
+        "variant_id": "string",
+        "name": "string",
+        "variant": "string",
+        "category": "string",
+        "brand": "string",
+        "retail_price": "double",
+        "wholesale_price": "double",
+        "unit_cost": "double",
+        "stock_available": "double",
+        "status": "string",
+        "source_platform": "string",
+        "created_date": "timestamp",
+        "modified_date": "timestamp"
+      }
+    }
+  }
+}

@@ -258,6 +258,9 @@ for name, df in results.items():
 # (e.g. sales_reps, used by resolvers but not a client-facing table) sets
 # export:false -- built and used, never written.
 written, internal = [], []
+# Fail before replacing any data if generated evidence and metadata disagree.
+build_full_catalog(tables_meta, strategies=STRATEGY_DEFINITIONS,
+                   schema_columns={name: df.columns for name, df in results.items()}, run_id=ctx["run_id"])
 for name, df in results.items():
     if tables_meta[name].get("export", True):
         df.write.mode("overwrite").parquet(gold_path(name).rstrip("/"))
@@ -275,7 +278,8 @@ for n in internal: print(f"· {n}: internal (export:false) -- built, not written
 # refreshes on the same pipeline run. This replaces the API's DESCRIBE + type
 # inference: types are declared where columns are born, not guessed downstream.
 catalog_out = f"abfss://{slug}@{storage_account}.dfs.core.windows.net/gold/catalog.json"
-write_catalog(tables_meta, catalog_out)
+write_catalog(tables_meta, catalog_out, strategies=STRATEGY_DEFINITIONS,
+              schema_columns={name: df.columns for name, df in results.items()}, run_id=ctx["run_id"])
 
 # COMMAND ----------
 

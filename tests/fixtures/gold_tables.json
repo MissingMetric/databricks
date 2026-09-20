@@ -1,0 +1,452 @@
+{
+  "_comment": "Gold table definitions. Every table LOADS from silver (source.tables joined on source.on), then runs dedup -> resolve -> metrics -> enrich -> derive with global barriers. Company-grain metrics are OWNED by the companies dimension (computed at company grain) and enriched DOWN onto order lines. A metric's `over` must be an identity column (own key or resolved FK). An enrich `bring` may only reference a source table's public surface. INSPECT: each catalog field carries `provenance` (native|resolved|metric|derived) plus a ref (strategy for resolved, agg for metric, expr for derived); the frontend holds the explanation prose keyed by those refs.",
+  "sales_reps": {
+    "_comment": "Internal rep dimension. Loaded from silver sales_reps_combined, deduped to one row per rep_id. Used by resolvers (owner_id->rep_email, native_then_company_owner) via ctx['dims'] AND exported as the source for the frontend sales-rep filter. export:true.",
+    "source": {
+      "tables": [
+        "sales_reps"
+      ],
+      "grain": "sales_reps",
+      "how": "single"
+    },
+    "own_keys": [
+      "id"
+    ],
+    "base_columns": [
+      "id",
+      "email",
+      "name",
+      "source_platform",
+      "created_date",
+      "modified_date"
+    ],
+    "dedup": {
+      "strategy": "keep_first",
+      "on": "id",
+      "order_by": "modified_date"
+    },
+    "resolve": {},
+    "metrics": [],
+    "enrich": [],
+    "derive": [],
+    "export": true,
+    "entity": "sales_rep",
+    "grain_pk": "id",
+    "catalog": {
+      "hidden": [
+        "sales_rep_e_source",
+        "sales_rep_e_created_date",
+        "sales_rep_e_modified_date"
+      ],
+      "fields": {
+        "sales_rep_e_id": {
+          "label": "Rep ID",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "sales_rep_e_email": {
+          "label": "Sales Rep Email",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "sales_rep_e_name": {
+          "label": "Rep Name",
+          "dataType": "string",
+          "provenance": "native"
+        }
+      }
+    }
+  },
+  "companies": {
+    "_comment": "Company dimension. Loads companies_combined (silver has already unioned HubSpot + order-derived companies into the full population). dedup canonicalizes the same business across sources on company_id. resolve owner_email (owner_id -> sales_reps.rep_email). company_* metrics are enriched in from the orders surface. derive display name + in_hubspot.",
+    "source": {
+      "tables": [
+        "companies"
+      ],
+      "grain": "companies",
+      "how": "single"
+    },
+    "own_keys": [
+      "id"
+    ],
+    "base_columns": [
+      "id",
+      "name",
+      "owner_id",
+      "primary_contact_id",
+      "source_platform",
+      "created_date",
+      "modified_date"
+    ],
+    "dedup": {
+      "strategy": "keep_first",
+      "on": "id",
+      "order_by": "modified_date"
+    },
+    "resolve": {
+      "sales_rep_e_email": {
+        "strategy": "owner_id_to_rep_email"
+      }
+    },
+    "metrics": [],
+    "enrich": [
+      {
+        "from": "orders",
+        "on": "company_e_id",
+        "bring": {
+          "company_e_ltv": "company_e_ltv",
+          "company_e_lifetime_orders": "company_e_lifetime_orders",
+          "company_e_first_order_date": "company_e_first_order_date",
+          "company_e_last_order_date": "company_e_last_order_date",
+          "company_e_cohort_month": "company_e_cohort_month",
+          "company_e_first_product": "company_e_first_product",
+          "company_e_days_since_last_order": "company_e_days_since_last_order"
+        }
+      }
+    ],
+    "derive": [
+      {
+        "name": "company_e_in_hubspot",
+        "expr": "is_not_null",
+        "of": "company_e_owner_id"
+      }
+    ],
+    "entity": "company",
+    "grain_pk": "id",
+    "catalog": {
+      "hidden": [
+        "company_e_source",
+        "sales_rep_e_source",
+        "company_e_owner_id",
+        "company_e_primary_contact_id"
+      ],
+      "fields": {
+        "company_e_id": {
+          "label": "Customer",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "company_e_name": {
+          "label": "Company",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "source_platform": {
+          "label": "Platform",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "sales_rep_e_email": {
+          "label": "Account Owner",
+          "dataType": "string",
+          "provenance": "resolved",
+          "strategy": "owner_id_to_rep_email"
+        },
+        "company_e_ltv": {
+          "label": "LTV",
+          "dataType": "currency",
+          "provenance": "metric",
+          "agg": "sum"
+        },
+        "company_e_lifetime_orders": {
+          "label": "Lifetime Orders",
+          "dataType": "number",
+          "provenance": "metric",
+          "agg": "count_distinct"
+        },
+        "company_e_first_order_date": {
+          "label": "First Order",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "min"
+        },
+        "company_e_last_order_date": {
+          "label": "Last Order",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "max"
+        },
+        "company_e_cohort_month": {
+          "label": "Cohort Month",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "cohort_month"
+        },
+        "company_e_first_product": {
+          "label": "First Product",
+          "dataType": "string",
+          "provenance": "metric",
+          "agg": "first_ordered"
+        },
+        "company_e_days_since_last_order": {
+          "label": "Days Since Last Order",
+          "dataType": "number",
+          "provenance": "metric",
+          "agg": "days_since"
+        },
+        "company_e_in_hubspot": {
+          "label": "In HubSpot",
+          "dataType": "string",
+          "provenance": "derived",
+          "expr": "is_not_null"
+        }
+      }
+    }
+  },
+  "orders": {
+    "_comment": "Order-line-grain fact. Loads order_line_items joined to orders headers on order_id+source_platform. resolve company_id + rep_email. metrics compute company_* over company_id (the fact is the natural place -- it has the line revenue). These metrics become the orders public surface that the companies dimension enriches FROM.",
+    "source": {
+      "tables": [
+        "order_line_items",
+        "orders"
+      ],
+      "grain": "order_line_items",
+      "on": [
+        {
+          "left": "order_id",
+          "right": "id"
+        },
+        "source_platform"
+      ],
+      "how": "inner",
+      "carried_keys": {
+        "order_id": "order_id"
+      }
+    },
+    "own_keys": [
+      "id",
+      "order_id"
+    ],
+    "base_columns": [
+      "order_id",
+      "order_line_id",
+      "source_platform",
+      "product_sku",
+      "product_name",
+      "quantity",
+      "line_revenue",
+      "unit_cost",
+      "order_reference",
+      "order_date",
+      "customer_email",
+      "customer_company",
+      "sales_rep_email",
+      "status",
+      "stage",
+      "cogs_generated_date"
+    ],
+    "dedup": {
+      "strategy": "none"
+    },
+    "resolve": {
+      "company_e_id": {
+        "strategy": "company_hubspot_match_with_fallback"
+      },
+      "sales_rep_e_email": {
+        "strategy": "sales_rep_order_native",
+        "by_platform": {
+          "shopify": "sales_rep_native_then_company_owner"
+        }
+      }
+    },
+    "metrics": [
+      {
+        "name": "company_e_ltv",
+        "agg": "sum",
+        "over": "company_e_id",
+        "of": "orders_e_line_revenue"
+      },
+      {
+        "name": "company_e_first_order_date",
+        "agg": "min",
+        "over": "company_e_id",
+        "of": "orders_e_date"
+      },
+      {
+        "name": "company_e_last_order_date",
+        "agg": "max",
+        "over": "company_e_id",
+        "of": "orders_e_date"
+      },
+      {
+        "name": "company_e_lifetime_orders",
+        "agg": "count_distinct",
+        "over": "company_e_id",
+        "of": "orders_e_order_id"
+      },
+      {
+        "name": "company_e_cohort_month",
+        "agg": "cohort_month",
+        "over": "company_e_id",
+        "of": "orders_e_date"
+      },
+      {
+        "name": "company_e_first_product",
+        "agg": "first_ordered",
+        "over": "company_e_id",
+        "of": "orders_e_product_name",
+        "order_by": "orders_e_date"
+      },
+      {
+        "name": "company_e_days_since_last_order",
+        "agg": "days_since",
+        "over": "company_e_id",
+        "of": "orders_e_date"
+      }
+    ],
+    "enrich": [
+      {
+        "from": "companies",
+        "on": "company_e_id",
+        "bring": {
+          "company_e_name": "company_e_name",
+          "sales_rep_e_email": "sales_rep_e_owner_email"
+        }
+      }
+    ],
+    "derive": [],
+    "entity": "orders",
+    "grain_pk": "id",
+    "catalog": {
+      "hidden": [
+        "orders_e_id",
+        "orders_e_order_id",
+        "company_e_source",
+        "company_e_mismatch",
+        "sales_rep_e_source"
+      ],
+      "fields": {
+        "orders_e_product_sku": {
+          "label": "SKU",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_product_name": {
+          "label": "Product",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_quantity": {
+          "label": "Quantity",
+          "dataType": "number",
+          "provenance": "native"
+        },
+        "orders_e_line_revenue": {
+          "label": "Revenue",
+          "dataType": "currency",
+          "provenance": "native"
+        },
+        "orders_e_unit_cost": {
+          "label": "Unit Cost",
+          "dataType": "currency",
+          "provenance": "native"
+        },
+        "orders_e_reference": {
+          "label": "Order Reference",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_date": {
+          "label": "Order Date",
+          "dataType": "date",
+          "provenance": "native"
+        },
+        "orders_e_customer_email": {
+          "label": "Customer Email",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_customer_company": {
+          "label": "Company (on order)",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_sales_rep_email": {
+          "label": "Rep (on order)",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_status": {
+          "label": "Status",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "orders_e_stage": {
+          "label": "Stage",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "source_platform": {
+          "label": "Platform",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "company_e_id": {
+          "label": "Customer",
+          "dataType": "string",
+          "provenance": "resolved",
+          "strategy": "company_hubspot_match_with_fallback"
+        },
+        "sales_rep_e_email": {
+          "label": "Sales Rep",
+          "dataType": "string",
+          "provenance": "resolved",
+          "strategy": "sales_rep_native_then_company_owner"
+        },
+        "company_e_ltv": {
+          "label": "Customer LTV",
+          "dataType": "currency",
+          "provenance": "metric",
+          "agg": "sum"
+        },
+        "company_e_first_order_date": {
+          "label": "First Order",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "min"
+        },
+        "company_e_last_order_date": {
+          "label": "Last Order",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "max"
+        },
+        "company_e_lifetime_orders": {
+          "label": "Lifetime Orders",
+          "dataType": "number",
+          "provenance": "metric",
+          "agg": "count_distinct"
+        },
+        "company_e_cohort_month": {
+          "label": "Cohort Month",
+          "dataType": "date",
+          "provenance": "metric",
+          "agg": "cohort_month"
+        },
+        "company_e_first_product": {
+          "label": "First Product",
+          "dataType": "string",
+          "provenance": "metric",
+          "agg": "first_ordered"
+        },
+        "company_e_days_since_last_order": {
+          "label": "Days Since Last Order",
+          "dataType": "number",
+          "provenance": "metric",
+          "agg": "days_since"
+        },
+        "company_e_name": {
+          "label": "Company",
+          "dataType": "string",
+          "provenance": "native"
+        },
+        "sales_rep_e_owner_email": {
+          "label": "Account Owner",
+          "dataType": "string",
+          "provenance": "resolved",
+          "strategy": "owner_id_to_rep_email"
+        }
+      }
+    }
+  }
+}

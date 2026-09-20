@@ -31,7 +31,9 @@
 # COMMAND ----------
 
 from pyspark.sql import DataFrame, Window
-from pyspark.sql.functions import col, lit, row_number
+from pyspark.sql.functions import col, lit, row_number, struct, to_json
+from datetime import datetime, timezone
+from uuid import uuid4
 
 # COMMAND ----------
 
@@ -43,19 +45,43 @@ METRIC   = {}   # name -> fn(df, spec, ctx) -> Column   (one aggregated column)
 ENRICH   = {}   # name -> fn(df, source_surface_df, spec, ctx) -> df
 DERIVE   = {}   # name -> fn(df, spec, ctx) -> Column   (post-enrich per-row expression)
 
-def _reg(registry, name):
+STRATEGY_DEFINITIONS = {}
+
+def _reg(registry, name, description, outcomes=None, inputs=None, version=1):
     def _wrap(fn):
         if name in registry:
             raise ValueError(f"{name} already registered")
         registry[name] = fn
+        stage = next(k for k, v in {"dedup": DEDUP, "resolve": RESOLVE,
+            "metric": METRIC, "enrich": ENRICH, "derive": DERIVE}.items() if v is registry)
+        ref = f"{stage}.{name}@{version}"
+        fn.strategy_ref = ref
+        STRATEGY_DEFINITIONS[ref] = {"id": ref, "name": name, "stage": stage,
+            "version": version, "description": description,
+            "outcomes": outcomes or {}, "inputs": inputs or {}}
         return fn
     return _wrap
 
-def dedup_strategy(name):  return _reg(DEDUP, name)
-def resolve_strategy(name): return _reg(RESOLVE, name)
-def metric_strategy(name): return _reg(METRIC, name)
-def enrich_strategy(name): return _reg(ENRICH, name)
-def derive_strategy(name): return _reg(DERIVE, name)
+def dedup_strategy(name, **definition): return _reg(DEDUP, name, **definition)
+def resolve_strategy(name, **definition): return _reg(RESOLVE, name, **definition)
+def metric_strategy(name, **definition): return _reg(METRIC, name, **definition)
+def enrich_strategy(name, **definition): return _reg(ENRICH, name, **definition)
+def derive_strategy(name, **definition): return _reg(DERIVE, name, **definition)
+
+
+def record_evidence(df, target, ref, source, inputs, ctx, result_column=None):
+    """Capture values BEFORE scratch columns are dropped. JSON preserves nulls
+    and has one schema across platform-specific strategies and Parquet exports.
+    Evidence is per application/output, never keyed by strategy name alone.
+    """
+    if result_column and result_column != target:
+        df = df.withColumn(target, col(result_column))
+    context = [lit(ref).alias("strategy"), lit(target).alias("field"),
+        lit(ctx["run_id"]).alias("run_id"), lit(ctx["processed_at"]).alias("processed_at"),
+        source.alias("source"), col(target).alias("result"),
+        struct(*[value.alias(key) for key, value in inputs.items()]).alias("inputs")]
+    return (df.withColumn(target + "_source", source)
+        .withColumn(target + "_evidence", to_json(struct(*context), {"ignoreNullFields": "false"})))
 
 # COMMAND ----------
 
@@ -105,7 +131,7 @@ def prefix_native(df: DataFrame, table_meta: dict) -> DataFrame:
 
     renames = {}
     for c in df.columns:
-        if c in system or "_e_" in c:
+        if c in system or "_e_" in c or c.startswith("__mm_"):
             continue
         if c == grain_pk:
             renames[c] = f"{entity}_e_id"
@@ -124,13 +150,19 @@ def run_dedup(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     if not spec:
         return df
     strat = spec.get("strategy", "keep_first")
-    return DEDUP[strat](df, spec, ctx)
+    result = DEDUP[strat](df, spec, ctx)
+    # Dedup records the surviving row, not discarded candidate rows.
+    inputs = {k: col(spec[k]) for k in ("on", "order_by") if spec.get(k)}
+    result = result.withColumn("__mm_dedup", lit("retained"))
+    return record_evidence(result, "__mm_dedup", DEDUP[strat].strategy_ref,
+        lit("retained"), inputs, ctx).drop("__mm_dedup")
 
 
 def run_resolve(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     """Apply each foreign-key / measure resolver in declaration order. Each adds
     its identity/measure column(s) and a *_source provenance column."""
     for target, spec in table_meta.get("resolve", {}).items():
+        spec = {**spec, "_target": target}
         strat = spec["strategy"]
         fn = RESOLVE[strat]
         # per-platform dispatch if the spec declares by_platform
@@ -141,15 +173,23 @@ def run_resolve(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
 def _resolve_maybe_per_platform(fn, df, spec, ctx, target):
     by_platform = spec.get("by_platform")
     if not by_platform:
-        return fn(df, spec, ctx)
+        result = fn(df, spec, ctx)
+        if target + "_evidence" not in result.columns:
+            raise ValueError(f"Resolver for {target} did not emit evidence")
+        return result
     # split by platform, apply the platform's chosen strategy, union back
     default_strat = spec.get("strategy")
     platforms = [r["source_platform"] for r in df.select("source_platform").distinct().collect()]
     parts = []
     for p in platforms:
         strat = by_platform.get(p, default_strat)
-        slice_df = df.filter(col("source_platform") == p)
-        parts.append(RESOLVE[strat](slice_df, spec, ctx))
+        slice_df = df.filter(col("source_platform").eqNullSafe(lit(p)))
+        result = RESOLVE[strat](slice_df, {**spec, "strategy": strat}, ctx)
+        if target + "_evidence" not in result.columns:
+            raise ValueError(f"Resolver for {target} did not emit evidence")
+        parts.append(result)
+    if not parts:
+        return fn(df, spec, ctx)
     out = parts[0]
     for part in parts[1:]:
         out = out.unionByName(part, allowMissingColumns=True)
@@ -162,13 +202,20 @@ def run_metrics(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     just registered strategies returning a Column."""
     for m in table_meta.get("metrics", []):
         strat = m["agg"]
+        roles = [k for k in ("of", "over", "order_by", "order_date") if m.get(k)]
+        for role in roles:
+            df = df.withColumn(f"__mm_metric_{role}", col(m[role]))
         df = df.withColumn(m["name"], METRIC[strat](df, m, ctx))
+        inputs = {role: col(f"__mm_metric_{role}") for role in roles}
+        df = record_evidence(df, m["name"], METRIC[strat].strategy_ref, lit("calculated"), inputs, ctx)
+        df = df.drop(*[f"__mm_metric_{role}" for role in roles])
     return df
 
 
 def run_enrich(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     """Join out to each source table's public surface and bring display columns."""
     for spec in table_meta.get("enrich", []):
+        spec = {"strategy": "left_join_bring", **spec}
         source_surface = ctx["surfaces"][spec["from"]]
         strat = spec.get("strategy", "left_join_bring")
         df = ENRICH[strat](df, source_surface, spec, ctx)
@@ -183,7 +230,14 @@ def run_derive(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     (coalesce) and boolean flags (in_hubspot) live."""
     for d in table_meta.get("derive", []):
         strat = d["expr"]
+        of = d.get("of", [])
+        keys = of if isinstance(of, list) else [of]
+        for index, key in enumerate(keys):
+            df = df.withColumn(f"__mm_derive_{index}", col(key))
         df = df.withColumn(d["name"], DERIVE[strat](df, d, ctx))
+        inputs = {key: col(f"__mm_derive_{index}") for index, key in enumerate(keys)}
+        df = record_evidence(df, d["name"], DERIVE[strat].strategy_ref, lit("derived"), inputs, ctx)
+        df = df.drop(*[f"__mm_derive_{index}" for index in range(len(keys))])
     return df
 
 # COMMAND ----------
@@ -218,6 +272,8 @@ def run_gold(tables_meta: dict, load_fn, ctx: dict) -> dict:
     export:false tables -- the caller decides what to write).
     """
     names = list(tables_meta)
+    ctx.setdefault("run_id", str(uuid4()))
+    ctx.setdefault("processed_at", datetime.now(timezone.utc).isoformat())
     frames = {}
 
     # STAGE 1: load + dedup (all tables). Nothing is joined against a table until
