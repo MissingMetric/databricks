@@ -18,6 +18,10 @@
 
 # COMMAND ----------
 
+# MAGIC %run ./gold_resolver_config
+
+# COMMAND ----------
+
 class GoldMetaError(Exception):
     pass
 
@@ -100,14 +104,11 @@ def validate_gold(tables_meta, DEDUP, RESOLVE, METRIC, ENRICH, DERIVE):
         if d and d.get("strategy") and d["strategy"] not in DEDUP:
             errors.append(f"[{name}] dedup strategy '{d['strategy']}' not registered")
 
-        # resolve strategies registered (incl. by_platform)
-        for tgt, spec in tm.get("resolve", {}).items():
-            strat = spec.get("strategy")
-            if strat and strat not in RESOLVE:
-                errors.append(f"[{name}] resolve '{tgt}' strategy '{strat}' not registered")
-            for plat, ps in (spec.get("by_platform") or {}).items():
-                if ps not in RESOLVE:
-                    errors.append(f"[{name}] resolve '{tgt}' by_platform[{plat}] strategy '{ps}' not registered")
+        try:
+            resolver_order(tm.get("resolve", {}), RESOLVE,
+                _base_columns({**tm, "_name": name}))
+        except ValueError as exc:
+            errors.append(f"[{name}] {exc}")
 
         # metrics: strategy registered + `over` is an identity column
         ids = identity_columns(tm)

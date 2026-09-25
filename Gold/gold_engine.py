@@ -31,7 +31,11 @@
 # COMMAND ----------
 
 from pyspark.sql import DataFrame, Window
-from pyspark.sql.functions import col, lit, row_number, struct, to_json
+from pyspark.sql.functions import col, lit, row_number, struct, to_json, array, concat, when
+
+# COMMAND ----------
+# MAGIC %run ./gold_resolver_config
+# COMMAND ----------
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -63,7 +67,15 @@ def _reg(registry, name, description, outcomes=None, inputs=None, version=1):
     return _wrap
 
 def dedup_strategy(name, **definition): return _reg(DEDUP, name, **definition)
-def resolve_strategy(name, **definition): return _reg(RESOLVE, name, **definition)
+def resolve_strategy(name, row_inputs=None, **definition):
+    def register(fn):
+        fn.row_inputs = row_inputs or {}
+        fn = _reg(RESOLVE, name, inputs={
+            key: {"origin": "row", "default_field": field}
+            for key, field in fn.row_inputs.items()
+        }, **definition)(fn)
+        return fn
+    return register
 def metric_strategy(name, **definition): return _reg(METRIC, name, **definition)
 def enrich_strategy(name, **definition): return _reg(ENRICH, name, **definition)
 def derive_strategy(name, **definition): return _reg(DERIVE, name, **definition)
@@ -89,25 +101,6 @@ def record_evidence(df, target, ref, source, inputs, ctx, result_column=None):
 # Each stage reads its slice of the table's metadata and dispatches to registered
 # strategies. `ctx` carries shared context (dims, other tables' surfaces, config).
 
-def prefix_native(df: DataFrame, table_meta: dict) -> DataFrame:
-    """Rename every NATIVE column (present after load+dedup) to `<entity>_e_<name>`.
-
-    This runs once, right after dedup, BEFORE resolve -- so raw silver columns
-    (including raw pre-resolve foreign keys) get THIS table's prefix, because at
-    this point they are native to this table's grain. The relationship-establishing
-    stages that come later (resolve/metric/enrich) emit their OWN correctly-prefixed
-    columns for other entities.
-
-    Exceptions, declared per table:
-      - `entity`:         the prefix to use (defaults to the table name)
-      - `system_columns`: columns that stay BARE and shared (e.g. source_platform)
-
-    Idempotent-ish: a column already containing `_e_` is left alone, so re-running
-    or already-prefixed inputs don't get double-prefixed.
-    """
-    entity = table_meta.get("entity", table_meta.get("_name"))
-    if not entity:
-        raise ValueError("prefix_native needs table_meta['entity'] or ['_name']")
 def prefix_native(df: DataFrame, table_meta: dict) -> DataFrame:
     """Name native columns from gold metadata (silver is bare). Three cases:
 
@@ -159,41 +152,86 @@ def run_dedup(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
 
 
 def run_resolve(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
-    """Apply each foreign-key / measure resolver in declaration order. Each adds
-    its identity/measure column(s) and a *_source provenance column."""
-    for target, spec in table_meta.get("resolve", {}).items():
-        spec = {**spec, "_target": target}
-        strat = spec["strategy"]
-        fn = RESOLVE[strat]
-        # per-platform dispatch if the spec declares by_platform
-        df = _resolve_maybe_per_platform(fn, df, spec, ctx, target)
+    resolvers = table_meta.get("resolve", {})
+    for target in resolver_order(resolvers, RESOLVE, df.columns):
+        variants = resolver_variants(resolvers[target])
+        if len(variants) == 1:
+            df = _resolve_chain(df, variants[None], ctx, target)
+            continue
+        if "source_platform" not in df.columns:
+            raise ValueError("Platform-specific chains require source_platform")
+        platforms = [r[0] for r in df.select("source_platform").distinct().collect()]
+        parts = [_resolve_chain(df.filter(col("source_platform").eqNullSafe(lit(p))),
+                    variants.get(p, variants[None]), ctx, target) for p in platforms]
+        if not parts:
+            df = _resolve_chain(df, variants[None], ctx, target)
+        else:
+            df = parts[0]
+            for part in parts[1:]:
+                df = df.unionByName(part)
     return df
 
 
-def _resolve_maybe_per_platform(fn, df, spec, ctx, target):
-    by_platform = spec.get("by_platform")
-    if not by_platform:
-        result = fn(df, spec, ctx)
-        if target + "_evidence" not in result.columns:
-            raise ValueError(f"Resolver for {target} did not emit evidence")
-        return result
-    # split by platform, apply the platform's chosen strategy, union back
-    default_strat = spec.get("strategy")
-    platforms = [r["source_platform"] for r in df.select("source_platform").distinct().collect()]
-    parts = []
-    for p in platforms:
-        strat = by_platform.get(p, default_strat)
-        slice_df = df.filter(col("source_platform").eqNullSafe(lit(p)))
-        result = RESOLVE[strat](slice_df, {**spec, "strategy": strat}, ctx)
-        if target + "_evidence" not in result.columns:
-            raise ValueError(f"Resolver for {target} did not emit evidence")
-        parts.append(result)
-    if not parts:
-        return fn(df, spec, ctx)
-    out = parts[0]
-    for part in parts[1:]:
-        out = out.unionByName(part, allowMissingColumns=True)
-    return out
+def _resolve_chain(df, steps, ctx, target):
+    """First success wins. Only unresolved rows are passed to the next piece.
+
+    Candidate strategies may add only __mm_candidate. They must preserve every
+    input row and return a string identity/value, status, reason and JSON inputs.
+    Ambiguous matches fail the build; they are never silently treated as no match.
+    """
+    scratch = ["__mm_attempts", "__mm_winner", "__mm_strategy", "__mm_reason",
+               "__mm_value", "__mm_candidate"]
+    if set(scratch) & set(df.columns):
+        raise ValueError("Reserved resolver scratch column collision")
+    attempt_type = "array<struct<step:string,strategy:string,status:string,reason:string,inputs:string>>"
+    pending = (df.withColumn("__mm_attempts", array().cast(attempt_type))
+        .withColumn("__mm_winner", lit(None).cast("string"))
+        .withColumn("__mm_strategy", lit(None).cast("string"))
+        .withColumn("__mm_reason", lit("unresolved"))
+        .withColumn("__mm_value", lit(None).cast("string")))
+    resolved = []
+    for step in steps:
+        fn = RESOLVE[step["strategy"]]
+        params = {**fn.row_inputs, **step["params"]}
+        candidate = fn(pending, params, ctx)
+        if set(candidate.columns) != set(pending.columns) | {"__mm_candidate"}:
+            raise ValueError(f"{step['id']}: strategy changed the input column contract")
+        # Multiset comparisons catch duplicated, removed AND modified input rows.
+        original = candidate.select(*pending.columns)
+        if (original.exceptAll(pending).limit(1).count()
+                or pending.exceptAll(original).limit(1).count()):
+            raise ValueError(f"{step['id']}: strategy did not preserve input rows")
+        fields = {f.name: f.dataType.simpleString() for f in candidate.schema["__mm_candidate"].dataType.fields}
+        if fields != {k: "string" for k in ("value", "status", "reason", "inputs")}:
+            raise ValueError(f"{step['id']}: invalid candidate schema")
+        c = col("__mm_candidate")
+        invalid = (c.isNull() | c.status.isNull() | c.reason.isNull() | c.inputs.isNull()
+            | ~c.status.isin("resolved", "no_match")
+            | ((c.status == "resolved") & c.value.isNull())
+            | ((c.status == "no_match") & c.value.isNotNull()))
+        if candidate.filter(invalid).limit(1).count():
+            raise ValueError(f"{step['id']}: ambiguous lookup or invalid candidate; resolution stopped")
+        attempt = struct(lit(step["id"]).alias("step"), lit(fn.strategy_ref).alias("strategy"),
+            c.status.alias("status"), c.reason.alias("reason"), c.inputs.alias("inputs"))
+        candidate = candidate.withColumn("__mm_attempts", concat(col("__mm_attempts"), array(attempt)))
+        won = (candidate.filter(c.status == "resolved")
+            .withColumn("__mm_winner", lit(step["id"]))
+            .withColumn("__mm_strategy", lit(fn.strategy_ref))
+            .withColumn("__mm_reason", c.reason)
+            .withColumn("__mm_value", c.value).drop("__mm_candidate"))
+        resolved.append(won)
+        pending = candidate.filter(c.status == "no_match").drop("__mm_candidate")
+    out = pending
+    for part in resolved:
+        out = out.unionByName(part)
+    out = out.withColumn(target, col("__mm_value")).withColumn(target + "_source", col("__mm_reason"))
+    envelope = struct(lit(2).alias("evidence_version"), lit(target).alias("field"),
+        col("__mm_strategy").alias("strategy"), col("__mm_winner").alias("winner_step"),
+        when(col("__mm_winner").isNotNull(), lit("resolved")).otherwise(lit("unresolved")).alias("status"),
+        col("__mm_reason").alias("source"), col(target).alias("result"),
+        lit(ctx["run_id"]).alias("run_id"), lit(ctx["processed_at"]).alias("processed_at"),
+        col("__mm_attempts").alias("attempts"))
+    return out.withColumn(target + "_evidence", to_json(envelope, {"ignoreNullFields": "false"})).drop(*scratch)
 
 
 def run_metrics(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
