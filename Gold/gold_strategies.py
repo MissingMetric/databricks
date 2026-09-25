@@ -17,7 +17,7 @@ from pyspark.sql.functions import (
     col, lit, when, lower, trim, regexp_replace, coalesce,
     sum as spark_sum, min as spark_min, max as spark_max, count as spark_count,
     countDistinct, first, date_trunc, datediff, current_date, size, collect_set,
-    date_format, row_number, struct, to_json,
+    date_format, row_number, struct, to_json, dense_rank,
 )
 
 # COMMAND ----------
@@ -234,6 +234,68 @@ def m_days_since(df, m, ctx):
 def m_is_current_month(df, m, ctx):
     # true if this row's order_date month == the cohort month column named in `of`
     return date_trunc("month", col(m["order_date"])) == col(m["of"])
+
+@metric_strategy(
+    "sequence",
+    description=(
+        "Assigns a consecutive sequence within the configured identity "
+        "partition, ordered by the configured field and direction. "
+        "The entity key breaks ordering ties. Repeated rows with the same "
+        "ordering value and entity key share a sequence number. "
+        "Rows missing a required input receive null and do not affect "
+        "the sequence of valid rows."
+    ),
+    outcomes={}
+)
+def m_sequence(df, m, ctx):
+    """
+    Required:
+      over:     Partition identity, e.g. customer ID.
+      of:       Entity identity, e.g. globally unique order ID.
+      order_by: Ordering field, e.g. order timestamp.
+
+    Optional:
+      direction: "asc" (default) or "desc".
+
+    All rows for an entity must share the same partition identity
+    and ordering value.
+    """
+    partition_key = m["over"]
+    entity_key = m["of"]
+    ordering_key = m["order_by"]
+    direction = m.get("direction", "asc").lower()
+
+    if direction not in ("asc", "desc"):
+        raise ValueError("sequence.direction must be 'asc' or 'desc'")
+
+    for key in (partition_key, entity_key, ordering_key):
+        if not isinstance(key, str) or key not in df.columns:
+            raise ValueError(
+                f"sequence requires an existing column name; received {key!r}"
+            )
+
+    valid = (
+        col(partition_key).isNotNull()
+        & col(entity_key).isNotNull()
+        & col(ordering_key).isNotNull()
+    )
+
+    ordering = (
+        col(ordering_key).asc()
+        if direction == "asc"
+        else col(ordering_key).desc()
+    )
+
+    # Separate invalid rows so they cannot shift valid sequence numbers.
+    window = (
+        Window.partitionBy(col(partition_key), valid)
+        .orderBy(ordering, col(entity_key).asc())
+    )
+
+    return when(
+        valid,
+        dense_rank().over(window)
+    ).otherwise(lit(None).cast("int"))
 
 # COMMAND ----------
 
