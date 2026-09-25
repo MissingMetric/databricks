@@ -5,9 +5,9 @@
 # table-specific lives in gold_tables.json; this notebook is just plumbing:
 #
 #   1. load engine + strategies + validator (via %run)
-#   2. load gold table metadata + per-client resolution overrides (Supabase)
-#   3. apply overrides onto the metadata's resolve strategy names (base+override)
-#   4. VALIDATE the merged metadata before any Spark work
+#   2. load shared table structure and complete client resolver config (Supabase)
+#   3. replace every resolver section with its client-owned configuration
+#   4. VALIDATE the assembled metadata before any Spark work
 #   5. wire load_fn per table (orders = lines⋈headers; companies = orders surface
 #      + HubSpot attrs) and run the five-stage engine
 #   6. write each gold table
@@ -32,7 +32,6 @@
 
 # COMMAND ----------
 
-import copy
 import json
 from pyspark.sql import Window
 from pyspark.sql.functions import col, row_number, lower, trim, regexp_replace
@@ -67,20 +66,8 @@ def download_json(path):
     return json.loads("".join(r.value for r in rows))
 
 
-def deep_merge(base, override):
-    out = copy.deepcopy(base)
-    for k, v in (override or {}).items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = deep_merge(out[k], v)
-        else:
-            out[k] = copy.deepcopy(v)
-    return out
-
-
 def fetch_client_resolution(slug):
-    """Per-client resolution override from client_configs. {} = pure metadata
-    defaults. Uses PostgREST directly (no supabase SDK -- it rejects the
-    sb_secret_ key format)."""
+    """Fetch the complete, required client-owned resolver configuration."""
     import requests
     resp = requests.get(
         f"{supabase_url.rstrip('/')}/rest/v1/client_configs_by_slug",
@@ -90,30 +77,21 @@ def fetch_client_resolution(slug):
     )
     resp.raise_for_status()
     rows = resp.json()
-    return (rows[0].get("resolution_config") or {}) if rows else {}
+    if len(rows) != 1 or not isinstance(rows[0].get("resolution_config"), dict):
+        raise ValueError(f"Expected one complete resolution_config for client {slug}")
+    return rows[0]["resolution_config"]
 
 # COMMAND ----------
 
-# ── Load metadata + apply per-client resolution overrides ────────────────────────
-# gold_tables.json declares each table's DEFAULT resolve strategies. The client's
-# resolution_config overrides strategy names per problem, e.g.
-#   { "orders": { "resolve": { "rep_email": { "strategy": "..." } } } }
-# Same base+override model as silver. Only the strategy names are overridable;
-# structure (which tables, which metrics) is fixed in the metadata.
-
+# Shared metadata describes structure. Supabase owns ALL resolver chains.
 gold_meta = download_json(config_path("Gold/gold_tables.json"))
 tables_meta = {k: v for k, v in gold_meta.items() if not k.startswith("_")}
-
-resolution_override = fetch_client_resolution(slug)
-if resolution_override:
-    tables_meta = deep_merge(tables_meta, resolution_override)
-    print(f"Applied client resolution override: {json.dumps(resolution_override)}")
-else:
-    print("No client override -- using metadata default strategies")
+tables_meta = client_resolver_tables(tables_meta, fetch_client_resolution(slug))
+print("Loaded complete client resolver configuration (no defaults or deep merge)")
 
 # COMMAND ----------
 
-# ── VALIDATE merged metadata before any Spark work ───────────────────────────────
+# ── VALIDATE client metadata before any Spark work ───────────────────────────────
 # Catches unregistered strategies, metrics grouping over non-identity columns,
 # enrichment pulling columns outside a source table's public surface.
 
@@ -132,11 +110,8 @@ for name, surf in surfaces.items():
 # so companies/sales_reps aren't read twice just because they're both a gold
 # table's source AND a resolve-time dimension.
 #
-# IMPORTANT (the raw-vs-surface distinction): ctx["dims"] holds the RAW silver
-# form -- company_id/company_name/owner_id as silver produced them. That is what
-# resolvers match against. It is NOT the built gold surface (with LTV etc.), which
-# only exists after stage 3 and lives in ctx["surfaces"]. Same entity, different
-# life-stage; resolve-time wants the raw one.
+# ctx['dims'] is the post-dedup, native-prefixed stage-one snapshot.
+# It never includes another table's resolver results or later enrichments.
 
 _TYPES = {"string": StringType(), "double": DoubleType(), "timestamp": TimestampType()}
 common_model = download_json(config_path("Common/common_model.json"))

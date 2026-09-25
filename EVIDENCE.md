@@ -1,58 +1,98 @@
-# Evidence-enabled gold catalog (v2)
+# Composable gold resolution and evidence
 
-## Contract
+## Ownership
 
-Strategy definitions are maintained with their decorators in `Gold/gold_strategies.py`.
-Edit the implementation and English description/outcomes together. Increment the
-decorator's `version` when semantics change. The registry publishes only strategies
-referenced by the merged client configuration, including platform overrides.
+Supabase's existing `client_configs_by_slug.resolution_config` is now the complete
+resolver document, not an override. It requires `schema_version: 1` and a `tables`
+object explicitly covering every gold table (use `resolve: {}` where appropriate).
+Missing config, unknown/missing tables and legacy strategy specs fail closed.
+Shared ADLS `Gold/gold_tables.json` still supplies table structure, catalog labels,
+metrics, enrichments and derives. Its resolve sections are replaced, never merged.
+This change moves **resolver policy**, not every gold-stage configuration, to Supabase.
 
-Each strategy application emits an output-specific `<target>_source` and
-`<target>_evidence`. Existing legacy source columns are retained for compatibility.
-Evidence is JSON text (not a Spark struct) so heterogeneous platform strategies
-union safely and export through Parquet/DuckDB without losing explicit nulls.
-The envelope contains `strategy`, `field`, `run_id`, `processed_at`, `source`,
-`result`, and `inputs`. Strategy IDs include their stage and version.
+Use `config/development.resolution_config.json` as the development client's complete
+resolver configuration. The example preserves the former platform distinction:
+native rep only by default; native then company-owner for Shopify.
+If fallback should apply on every platform, put both strategies in the default chain.
 
-Resolver evidence captures lookup values before scratch columns are dropped.
-Metric evidence is compact: it records the current row's input, partition key,
-ordering input when configured, and the result—not every row in the partition.
-Dedup evidence describes the retained row, not discarded candidates. Enrichment
-records its own join and carries the source field's complete evidence under
-`inputs.upstream_decision`; resolver dependency evidence can be nested similarly.
-Derived fields record their configured inputs, including explicit nulls.
+## Strategy contract
 
-The client catalog is `{schema_version: 2, run_id, tables, strategies}`. Each field
-has explicit evidence column mappings. Table metadata authorizes the fields usable
-for evidence queries, record display, and record identity. The API does not infer
-column names from suffixes or contain business-field dictionaries.
+A chain uses strings or objects with `id`, `strategy` and `params`.
+Each platform variant supplies a full replacement chain. First success wins;
+only unresolved rows enter the next step. Blank strings count as missing.
+All unresolved outputs are null, not the literal identity "unresolved".
 
-## Compatibility and rollout
+Resolver functions return their input rows plus `__mm_candidate`, a struct of
+string fields: value, status, reason and inputs (JSON text preserving nulls).
+They do not assign output columns or decide precedence. The engine validates
+row preservation using multiset comparisons and checks the candidate contract.
+These checks incur Spark jobs and shuffles; benchmark with representative data
+before production. Conflicting directory matches fail the build instead of
+choosing an arbitrary record or silently falling through.
+Identical lookup payloads are collapsed safely.
 
-1. Deploy the API compatibility reader and new evidence endpoint first. It serves
-   old catalogs normally and reports evidence unavailable without inventing facts.
-2. Deploy the Next.js client. Existing reports remain readable before a gold rebuild.
-3. Sync the changed gold notebooks and run the tests below in a development workspace.
-4. Run the gold build for a development client. No cloud configuration files need
-   changes for the supplied configuration; actual merged overrides drive the catalog.
-5. Refresh both API data and catalog, refresh the report, then compare selected
-   values with evidence totals before rolling out to other clients.
+Each strategy declares its row inputs and default column parameters in its
+decorator. Unknown params/strategies/inputs and dependency cycles are rejected.
+Resolver targets are topologically ordered, including dependencies in platform
+variants. Directory inputs always come from the post-dedup, native-prefixed
+stage-one snapshot, never partially resolved tables.
 
-No deployment or Databricks run is performed by the local implementation.
-Downloaded configuration files are preserved as test fixtures, not deployment sources.
-The source's existing attribution outcomes and ambiguous-match behavior are not
-changed. English definitions describe their actual limitations.
+Current resolver pieces return string identities/emails. Adding numeric resolver
+pieces will require extending the explicit candidate type contract; no implicit
+conversion is used to claim numeric metrics are supported here.
 
-## Validation
+## Evidence and catalog
 
-Local: `python -m unittest discover -s tests -v` (catalog and syntax tests).
-API: install DuckDB/FastAPI in a test environment and run `python -m unittest test_evidence -v`
-from the API repository. Those tests use synthetic data and an in-memory database.
+The engine writes one `<target>_source` and `<target>_evidence` pair.
+Obsolete `company_e_source`, `company_e_mismatch`, and `sales_rep_e_source`
+side effects are not emitted by resolvers.
+Resolver evidence version 2 includes:
 
-Spark runtime validation is still required in a development Databricks workspace.
-Run `%run ./gold_strategies`, then exercise direct/fallback/unresolved resolution,
-null platform dispatch, empty input, metrics, and left/full enrichment. Compare
-original output values and row counts, parse each evidence JSON, verify explicit
-null inputs, and confirm the JSON survives a Parquet round trip. Validate enriched
-account-owner evidence retains its original owner-ID lookup beneath the join.
-Do not treat local catalog/SQL tests as a substitute for this Spark check.
+- field, run_id, processed_at, result, status
+- strategy and winner_step (null if exhausted)
+- source (winning reason, or unresolved)
+- attempts, in execution order: step, strategy, status, reason, inputs
+
+Attempt inputs are JSON strings inside the envelope to preserve heterogeneous
+schemas across strategies/platforms. Explain parses them, including nested
+company-decision evidence. Later, unattempted steps do not appear on a record.
+The field catalog's `provenance.resolution` lists the full default/platform chains.
+Shared English definitions remain next to implementations in decorators and
+are published once per client, only for configured strategies.
+Catalog schema version remains 2; resolver evidence has its own version.
+
+Other stages retain their existing evidence contracts. Metric evidence records
+the row's configured inputs/partition/result, not all rows in the aggregate.
+Enrichment carries source evidence in `inputs.upstream_decision`.
+
+The API still groups by winning strategy/source using catalog-mapped fields.
+Exhausted chains form an unresolved group; corrupt/missing evidence is separate.
+Explain shows configured precedence, actual attempts, values used and raw details.
+This is not a new field-level redaction policy: existing evidence visibility
+limits described in the previous review still apply.
+
+## Development rollout (manual; not deployed by this change)
+
+1. Replace the development client's `resolution_config` JSON in Supabase with
+   the example above. Use the actual table behind the existing view; this repo
+   does not contain that database schema, so no guessed SQL migration is supplied.
+2. Sync all changed Gold notebooks, including the new `gold_resolver_config.py`.
+   Do not mix old combined strategies with the new engine.
+3. Run `Gold/gold_evidence_smoke.py` on a development Databricks cluster. It uses
+   synthetic in-memory data, no cloud reads/writes. Verify performance on a
+   representative development snapshot before production.
+4. Deploy the API and frontend changes together with the new data contract.
+5. Run the development gold build; refresh both API data and catalog caches,
+   then refresh the report. Compare totals and inspect direct/fallback/unresolved
+   records. Gold exports are still the existing non-atomic write process.
+6. If reverting, restore the previous code AND config/data snapshot together.
+   There is intentionally no legacy resolver configuration compatibility.
+
+## Local verification
+
+- Databricks repo: `python -m unittest discover -s tests -v`.
+- API repo: `python -m unittest test_evidence -v` (synthetic DuckDB).
+- Frontend: TypeScript check and the existing Node regression tests.
+- Spark smoke tests must run in Databricks when PySpark/Java are unavailable locally.
+
+Local tests are not a substitute for executing the Spark smoke notebook.

@@ -2,17 +2,21 @@
 # Databricks notebook source
 # Gold field catalog builder
 # ─────────────────────────────────────────────────────────────────────────────
-"""Generate a client-specific v2 catalog from merged gold configuration.
+"""Generate a client-specific v2 catalog from client gold configuration.
 
 Output: {schema_version, run_id, tables, strategies}. English descriptions live
 with strategy decorators, not in this module or in frontend business dictionaries.
 Only used strategies are published, once per client. Field provenance is derived
-from the actual merged resolver/metric/enrich/derive configuration, including
-platform overrides. Evidence columns are explicitly mapped per output field.
+from the actual client resolver/metric/enrich/derive configuration, including
+platform-specific chains. Evidence columns are explicitly mapped per output field.
 The authored catalog still controls labels, data types and editor visibility.
 """
 import json
 import copy
+
+# COMMAND ----------
+# MAGIC %run ./gold_resolver_config
+# COMMAND ----------
 
 # semantic dataType -> (valid aggregations, groupable). Derived, not authored.
 _AGG_RULES = {
@@ -31,7 +35,7 @@ _VALID_PROVENANCE = {"native", "resolved", "metric", "derived"}
 def _build_provenance(table_name: str, key: str, spec: dict) -> dict:
     """Assemble the minimal provenance object from the field's catalog spec.
     type is required (defaults native); strategy/agg/expr are carried per type.
-    The frontend holds the prose keyed by these; the catalog carries only refs."""
+    build_full_catalog replaces these hints with actual strategy references."""
     prov_type = spec.get("provenance", "native")
     if prov_type not in _VALID_PROVENANCE:
         raise ValueError(
@@ -105,11 +109,21 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         refs, definition = [], {}
         if key in tm.get("resolve", {}):
             spec = tm["resolve"][key]
-            default = reference("resolve", spec["strategy"])
-            overrides = {p: reference("resolve", s) for p, s in spec.get("by_platform", {}).items()}
-            refs = list(dict.fromkeys([default, *overrides.values()]))
-            definition = {"type": "resolved", "strategy": spec["strategy"],
-                          "default_strategy": default, "by_platform": overrides}
+            variants = resolver_variants(spec)
+            def publish(steps):
+                published = []
+                for step in steps:
+                    ref = reference("resolve", step["strategy"])
+                    defaults = {k: v["default_field"] for k, v in strategies[ref].get("inputs", {}).items()
+                                if isinstance(v, dict) and "default_field" in v}
+                    published.append({**copy.deepcopy(step), "strategy": ref,
+                                      "params": {**defaults, **step["params"]}})
+                return published
+            chain = publish(variants[None])
+            platforms = {p: publish(steps) for p, steps in variants.items() if p is not None}
+            refs = list(dict.fromkeys(step["strategy"] for steps in [chain, *platforms.values()] for step in steps))
+            definition = {"type": "resolved", "resolution": {"policy": "first_success",
+                "strategies": chain, "by_platform": platforms}}
         else:
             for stage, section, op in [("metric", "metrics", "agg"), ("derive", "derive", "expr")]:
                 spec = next((s for s in tm.get(section, []) if s["name"] == key), None)
@@ -177,8 +191,9 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         if not isinstance(tm, dict):
             continue
         for spec in tm.get("resolve", {}).values():
-            for s in [spec["strategy"], *spec.get("by_platform", {}).values()]:
-                reference("resolve", s)
+            for steps in resolver_variants(spec).values():
+                for step in steps:
+                    reference("resolve", step["strategy"])
         for stage, section, op in [("metric", "metrics", "agg"), ("derive", "derive", "expr")]:
             for spec in tm.get(section, []):
                 reference(stage, spec[op])

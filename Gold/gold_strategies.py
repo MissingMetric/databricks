@@ -17,7 +17,7 @@ from pyspark.sql.functions import (
     col, lit, when, lower, trim, regexp_replace, coalesce,
     sum as spark_sum, min as spark_min, max as spark_max, count as spark_count,
     countDistinct, first, date_trunc, datediff, current_date, size, collect_set,
-    date_format, row_number, dense_rank
+    date_format, row_number, struct, to_json, dense_rank,
 )
 
 # COMMAND ----------
@@ -33,23 +33,6 @@ def company_match_key(c):
     k = regexp_replace(k, r"\s+", " ")
     return trim(k)
 
-
-def company_owner_email_lookup(dims: dict) -> DataFrame:
-    """company.owner_id -> sales_reps.rep_email. Same helper the dimension uses."""
-    companies = dims["companies"]
-    reps = dims["sales_reps"]
-    rep_lookup = reps.select(
-        col("sales_rep_e_id").alias("_rep_id"),
-        col("sales_rep_e_email").alias("_rep_email"),
-    ).dropDuplicates(["_rep_id"])
-    return (
-        companies
-        .select(col("company_e_id").alias("_oc_company_id"), 
-        col("company_e_owner_id").alias("_oc_owner_id"))
-        .join(rep_lookup, col("_oc_owner_id") == col("_rep_id"), "left")
-        .select(col("_oc_company_id"), col("_oc_owner_id"), col("_rep_email").alias("_company_owner_email"))
-        .dropDuplicates(["_oc_company_id"])
-    )
 
 # COMMAND ----------
 
@@ -82,115 +65,108 @@ def dedup_keep_first(df, spec, ctx):
 # STAGE 2 -- RESOLVE strategies (ported from the current resolvers)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@resolve_strategy("company_order_string_only",
-    description="Uses normalized company text from the order as the company identity; no company lookup is performed.",
-    outcomes={"order_string_only":"The order-text-only strategy ran. A missing name may still yield an unresolved identity."})
-def r_company_order_string_only(df, spec, ctx):
-    result = (
-        df
-        .withColumn("company_key", company_match_key(col("orders_e_customer_company")))
-        .withColumn("company_e_id",
-            when(col("company_key") == "", lit("unresolved"))
-            .when(col("company_key").isNull(), lit("unresolved"))
-            .otherwise(col("company_key")))
-        .withColumn("company_e_source", lit("order_string_only"))
-        .withColumn("company_e_mismatch", lit(False))
-    )
-    return record_evidence(result, spec["_target"], r_company_order_string_only.strategy_ref,
-        col("company_e_source"), {"order_company": col("orders_e_customer_company"),
-        "normalized_name": col("company_key")}, ctx, result_column="company_e_id").drop("company_key")
+def _candidate(df, value, reason, inputs, ambiguous=None):
+    usable = value.isNotNull() & (trim(value.cast("string")) != "")
+    status = when(usable, lit("resolved")).otherwise(lit("no_match"))
+    if ambiguous is not None:
+        status = when(ambiguous, lit("ambiguous")).otherwise(status)
+    return df.withColumn("__mm_candidate", struct(
+        when(usable, value.cast("string")).alias("value"),
+        status.alias("status"),
+        when(status == "ambiguous", lit("ambiguous_lookup"))
+            .when(usable, lit(reason)).otherwise(lit("missing_input_or_match")).alias("reason"),
+        to_json(struct(*[v.alias(k) for k, v in inputs.items()]),
+                {"ignoreNullFields": "false"}).alias("inputs")))
 
 
-@resolve_strategy("company_hubspot_match_with_fallback",
-    description="Matches normalized order company text against the companies dimension, falling back to normalized order text. Matching removes case, periods, commas, selected company suffixes, and repeated spaces.",
-    outcomes={"hubspot":"A normalized-name match was found in the companies dimension. The historical 'hubspot' tag alone does not establish the matched record's platform.","order_string":"No lookup match was found; normalized order company text supplied the identity.","unresolved":"Neither a lookup match nor usable order company text supplied an identity."})
-def r_company_hubspot_match(df, spec, ctx):
-    companies = ctx["dims"]["companies"]
-    comp_lookup = (
-        companies
-        .withColumn("_ckey", company_match_key(col("company_e_name")))
-        .select(col("company_e_id").alias("_hs_company_id"), col("_ckey"),
-                col("company_e_name").alias("_matched_name"),
-                col("source_platform").alias("_matched_platform"))
-        .dropDuplicates(["_ckey"])
-    )
-    f = df.withColumn("company_key", company_match_key(col("orders_e_customer_company")))
-    joined = f.join(comp_lookup, f["company_key"] == comp_lookup["_ckey"], "left")
-    result = (
-        joined
-        .withColumn("company_e_id",
-            coalesce(col("_hs_company_id"),
-                     when(col("company_key") != "", col("company_key"))))
-        .withColumn("company_e_id", coalesce(col("company_e_id"), lit("unresolved")))
-        .withColumn("company_e_source",
-            when(col("_hs_company_id").isNotNull(), lit("hubspot"))
-            .when(col("company_key") != "", lit("order_string"))
-            .otherwise(lit("unresolved")))
-        .withColumn("company_e_mismatch",
-            (col("company_key") != "") & col("_hs_company_id").isNull())
-    )
-    return record_evidence(result, spec["_target"], r_company_hubspot_match.strategy_ref,
-        col("company_e_source"), {"order_company": col("orders_e_customer_company"),
-        "normalized_name": col("company_key"), "matched_company_id": col("_hs_company_id"),
-        "matched_company_name": col("_matched_name"), "matched_platform": col("_matched_platform")},
-        ctx, result_column="company_e_id").drop("company_key", "_ckey", "_hs_company_id", "_matched_name", "_matched_platform")
+def _unique_lookup(df, key, fields):
+    """One lookup row per key. Conflicting payloads are flagged, never picked."""
+    values = struct(*[col(field).alias(field) for field in fields])
+    return (df.filter(col(key).isNotNull()).groupBy(key)
+        .agg(collect_set(values).alias("__mm_matches"))
+        .withColumn("__mm_ambiguous", size(col("__mm_matches")) > 1)
+        .select(col(key).alias("__mm_lookup_key"), "__mm_ambiguous",
+            *[when(~col("__mm_ambiguous"), col("__mm_matches")[0][field])
+                .alias("__mm_lookup_" + field) for field in fields]))
 
 
-@resolve_strategy("sales_rep_order_native",
-    description="Uses the sales rep recorded on the order. This strategy does not attempt a company-owner fallback.",
-    outcomes={"order_native":"The order rep was non-null and was used directly.","unresolved":"The order rep was null; this strategy has no fallback."})
-def r_rep_order_native(df, spec, ctx):
-    result = (
-        df
-        .withColumn("sales_rep_e_email", col("orders_e_sales_rep_email"))
-        .withColumn("sales_rep_e_source",
-            when(col("orders_e_sales_rep_email").isNotNull(), lit("order_native"))
-            .otherwise(lit("unresolved")))
-    )
-    return record_evidence(result, spec["_target"], r_rep_order_native.strategy_ref,
-        col("sales_rep_e_source"), {"order_rep": col("orders_e_sales_rep_email")}, ctx, result_column="sales_rep_e_email")
+@resolve_strategy("company_order_string",
+    row_inputs={"field": "orders_e_customer_company"},
+    description="Uses normalized company text from the configured row field as the company identity. No directory lookup is attempted.",
+    outcomes={"order_string": "Normalized order company text supplied the identity.",
+              "missing_input_or_match": "No usable company text was supplied."})
+def r_company_order_string(df, params, ctx):
+    value = company_match_key(col(params["field"]))
+    return _candidate(df, value, "order_string",
+        {"order_company": col(params["field"]), "normalized_name": value})
 
 
-@resolve_strategy("sales_rep_native_then_company_owner",
-    description="Uses the order rep when non-null; otherwise joins the resolved company to its owner ID and looks up that owner's rep email.",
-    outcomes={"order_native":"The order rep was non-null and won over the owner fallback.","company_owner":"The order rep was null. The matched company's owner lookup supplied the rep email.","unresolved":"The order rep was null and the owner lookup supplied no email. Inspect the recorded inputs for missing values."})
-def r_rep_native_then_company_owner(df, spec, ctx):
-    owner_lookup = company_owner_email_lookup(ctx["dims"])
-    joined = df.join(owner_lookup, df["company_e_id"] == owner_lookup["_oc_company_id"], "left")
-    result = (
-        joined
-        .withColumn("sales_rep_e_email",
-            coalesce(col("orders_e_sales_rep_email"), col("_company_owner_email")))
-        .withColumn("sales_rep_e_source",
-            when(col("orders_e_sales_rep_email").isNotNull(), lit("order_native"))
-            .when(col("_company_owner_email").isNotNull(), lit("company_owner"))
-            .otherwise(lit("unresolved")))
-    )
-    inputs = {"order_rep": col("orders_e_sales_rep_email"),
-        "company_id": col("company_e_id"), "matched_company_id": col("_oc_company_id"),
-        "owner_id": col("_oc_owner_id"), "owner_email": col("_company_owner_email")}
-    if "company_e_id_evidence" in result.columns:
-        inputs["company_decision"] = col("company_e_id_evidence")
-    return record_evidence(result, spec["_target"], r_rep_native_then_company_owner.strategy_ref,
-        col("sales_rep_e_source"), inputs, ctx, result_column="sales_rep_e_email").drop("_oc_company_id", "_oc_owner_id", "_company_owner_email")
+@resolve_strategy("company_normalized_name_match",
+    row_inputs={"field": "orders_e_customer_company"},
+    description="Matches normalized row company text to the companies directory. Normalization removes case, punctuation, selected suffixes and repeated spaces. Conflicting matches stop the build.",
+    outcomes={"company_name_match": "A unique normalized-name match supplied the company identity.",
+              "missing_input_or_match": "No usable company name or directory match was found."})
+def r_company_normalized_name_match(df, params, ctx):
+    lookup = _unique_lookup(ctx["dims"]["companies"].withColumn(
+        "__mm_name", company_match_key(col("company_e_name"))),
+        "__mm_name", ["company_e_id", "company_e_name", "source_platform"])
+    key = company_match_key(col(params["field"]))
+    joined = df.join(lookup, (key != "") & (key == col("__mm_lookup_key")), "left")
+    result = _candidate(joined, col("__mm_lookup_company_e_id"), "company_name_match", {
+        "order_company": col(params["field"]), "normalized_name": key,
+        "matched_company_id": col("__mm_lookup_company_e_id"),
+        "matched_company_name": col("__mm_lookup_company_e_name"),
+        "matched_platform": col("__mm_lookup_source_platform")},
+        col("__mm_ambiguous"))
+    return result.drop(*lookup.columns)
 
 
-@resolve_strategy("owner_id_to_rep_email",
-    description="Looks up the company owner ID in the rep dimension and returns the matched email.",
-    outcomes={"owner_lookup":"An email was returned by the owner-ID lookup.","unresolved":"The owner-ID lookup returned no email."})
-def r_owner_id_to_rep_email(df, spec, ctx):
-    """Company dimension: resolve owner_id -> sales_reps.rep_email. The company
-    carries a raw HubSpot owner_id (silver, Option B); this joins the sales_reps
-    dimension to produce owner_email. Order-derived companies have null owner_id
-    -> null owner_email, which the in_hubspot derive then flags false."""
-    reps = ctx["dims"]["sales_reps"].select(
-        col("sales_rep_e_id").alias("_rid"), col("sales_rep_e_email").alias("_re")
-    ).dropDuplicates(["_rid"])
-    result = df.join(reps, col("company_e_owner_id") == col("_rid"), "left").withColumn("sales_rep_e_email", col("_re"))
-    return record_evidence(result, spec["_target"], r_owner_id_to_rep_email.strategy_ref,
-        when(col("_re").isNotNull(), lit("owner_lookup")).otherwise(lit("unresolved")),
-        {"owner_id": col("company_e_owner_id"), "matched_rep_id": col("_rid"),
-         "matched_email": col("_re")}, ctx, result_column="sales_rep_e_email").drop("_rid", "_re")
+@resolve_strategy("sales_rep_order_native", version=2,
+    row_inputs={"field": "orders_e_sales_rep_email"},
+    description="Uses the rep email recorded in the configured row field. Missing or blank values leave the row unresolved for the next configured step.",
+    outcomes={"order_native": "The order's recorded sales rep supplied the email.",
+              "missing_input_or_match": "The order had no usable sales rep email."})
+def r_rep_order_native(df, params, ctx):
+    return _candidate(df, col(params["field"]), "order_native",
+        {"order_rep": col(params["field"])})
+
+
+@resolve_strategy("sales_rep_company_owner",
+    row_inputs={"company_field": "company_e_id"},
+    description="Looks up the resolved company in the companies directory, then looks up its owner in the rep directory. It does not read the order's native rep.",
+    outcomes={"company_owner": "The company's owner supplied the sales rep email.",
+              "missing_input_or_match": "The company, owner ID or owner email could not be matched."})
+def r_rep_company_owner(df, params, ctx):
+    companies = _unique_lookup(ctx["dims"]["companies"], "company_e_id", ["company_e_owner_id"])
+    joined = df.join(companies, col(params["company_field"]) == col("__mm_lookup_key"), "left")
+    joined = (joined.withColumnRenamed("__mm_lookup_key", "__mm_company_key")
+        .withColumnRenamed("__mm_ambiguous", "__mm_company_ambiguous"))
+    reps = _unique_lookup(ctx["dims"]["sales_reps"], "sales_rep_e_id", ["sales_rep_e_email"])
+    joined = joined.join(reps, col("__mm_lookup_company_e_owner_id") == col("__mm_lookup_key"), "left")
+    inputs = {"company_id": col(params["company_field"]), "matched_company_id": col("__mm_company_key"),
+        "owner_id": col("__mm_lookup_company_e_owner_id"), "matched_rep_id": col("__mm_lookup_key"),
+        "owner_email": col("__mm_lookup_sales_rep_e_email")}
+    upstream = params["company_field"] + "_evidence"
+    if upstream in df.columns:
+        inputs["company_decision"] = col(upstream)
+    result = _candidate(joined, col("__mm_lookup_sales_rep_e_email"), "company_owner", inputs,
+        coalesce(col("__mm_company_ambiguous"), lit(False)) | coalesce(col("__mm_ambiguous"), lit(False)))
+    return result.drop("__mm_company_key", "__mm_company_ambiguous",
+        "__mm_lookup_company_e_owner_id", *reps.columns)
+
+
+@resolve_strategy("owner_id_to_rep_email", version=2,
+    row_inputs={"owner_field": "company_e_owner_id"},
+    description="Looks up the configured row owner ID in the rep directory and returns its unique email.",
+    outcomes={"owner_lookup": "An email was returned by the owner-ID lookup.",
+              "missing_input_or_match": "No usable owner ID or matching rep email was found."})
+def r_owner_id_to_rep_email(df, params, ctx):
+    reps = _unique_lookup(ctx["dims"]["sales_reps"], "sales_rep_e_id", ["sales_rep_e_email"])
+    joined = df.join(reps, col(params["owner_field"]) == col("__mm_lookup_key"), "left")
+    result = _candidate(joined, col("__mm_lookup_sales_rep_e_email"), "owner_lookup",
+        {"owner_id": col(params["owner_field"]), "matched_rep_id": col("__mm_lookup_key"),
+         "matched_email": col("__mm_lookup_sales_rep_e_email")}, col("__mm_ambiguous"))
+    return result.drop(*reps.columns)
 
 # COMMAND ----------
 

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tables": {
+    "sales_reps": {"resolve": {}},
+    "companies": {
+      "resolve": {
+        "sales_rep_e_email": {"strategies": ["owner_id_to_rep_email"]}
+      }
+    },
+    "orders": {
+      "resolve": {
+        "company_e_id": {
+          "strategies": ["company_normalized_name_match", "company_order_string"]
+        },
+        "sales_rep_e_email": {
+          "strategies": ["sales_rep_order_native"],
+          "by_platform": {
+            "shopify": {"strategies": ["sales_rep_order_native", "sales_rep_company_owner"]}
+          }
+        }
+      }
+    }
+  }
+}

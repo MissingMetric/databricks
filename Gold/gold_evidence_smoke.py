@@ -23,9 +23,9 @@ orders = spark.createDataFrame([
 ctx = {"dims": {"companies": companies, "sales_reps": reps},
        "run_id": "synthetic-smoke", "processed_at": "2026-01-01T00:00:00+00:00"}
 meta = {"resolve": {
-    "company_e_id": {"strategy": "company_hubspot_match_with_fallback"},
-    "sales_rep_e_email": {"strategy": "sales_rep_order_native",
-                          "by_platform": {"shopify": "sales_rep_native_then_company_owner"}},
+    "company_e_id": {"strategies": ["company_normalized_name_match", "company_order_string"]},
+    "sales_rep_e_email": {"strategies": ["sales_rep_order_native"],
+                          "by_platform": {"shopify": {"strategies": ["sales_rep_order_native", "sales_rep_company_owner"]}}},
 }}
 resolved = run_resolve(orders, meta, ctx)
 rows = {r.orders_e_id: r.asDict() for r in resolved.collect()}
@@ -36,19 +36,24 @@ assert rows["r3"]["sales_rep_e_email"] is None
 assert rows["r4"]["sales_rep_e_email"] is None
 fallback = json.loads(rows["r2"]["sales_rep_e_email_evidence"])
 assert fallback["source"] == "company_owner"
-assert "order_rep" in fallback["inputs"] and fallback["inputs"]["order_rep"] is None
-assert fallback["inputs"]["owner_id"] == "o1"
-assert json.loads(fallback["inputs"]["company_decision"])["inputs"]["matched_company_id"] == "c1"
-assert json.loads(rows["r4"]["sales_rep_e_email_evidence"])["strategy"] == "resolve.sales_rep_order_native@1"
+assert len(fallback["attempts"]) == 2
+assert json.loads(fallback["attempts"][0]["inputs"])["order_rep"] is None
+owner_inputs = json.loads(fallback["attempts"][1]["inputs"])
+assert owner_inputs["owner_id"] == "o1"
+company_trace = json.loads(owner_inputs["company_decision"])
+assert json.loads(company_trace["attempts"][0]["inputs"])["matched_company_id"] == "c1"
+assert len(json.loads(rows["r1"]["sales_rep_e_email_evidence"])["attempts"]) == 1
+unresolved = json.loads(rows["r4"]["sales_rep_e_email_evidence"])
+assert unresolved["strategy"] is None and unresolved["status"] == "unresolved"
 assert run_resolve(orders.limit(0), meta, ctx).count() == 0
 
-owner = run_resolve(companies, {"resolve": {"sales_rep_e_email": {"strategy": "owner_id_to_rep_email"}}}, ctx)
+owner = run_resolve(companies, {"resolve": {"sales_rep_e_email": {"strategies": ["owner_id_to_rep_email"]}}}, ctx)
 ctx["surfaces"] = {"people": owner}
 enriched = run_enrich(resolved, {"enrich": [{"from": "people", "on": "company_e_id",
     "bring": {"sales_rep_e_email": "account_owner"}}]}, ctx)
 record = enriched.filter("orders_e_id = 'r2'").first().asDict()
 trace = json.loads(record["account_owner_evidence"])
-assert json.loads(trace["inputs"]["upstream_decision"])["inputs"]["owner_id"] == "o1"
+assert json.loads(json.loads(trace["inputs"]["upstream_decision"])["attempts"][0]["inputs"])["owner_id"] == "o1"
 assert enriched.count() == orders.count()
 
 metrics = run_metrics(resolved, {"metrics": [{"name": "total", "agg": "sum", "of": "amount", "over": "company_e_id"}]}, ctx)
@@ -58,3 +63,32 @@ assert json.loads(derived.filter("orders_e_id = 'r3'").first().has_rep_evidence)
 deduped = run_dedup(orders, {"dedup": {"strategy": "none"}}, ctx)
 assert "__mm_dedup_evidence" in deduped.columns
 print("Synthetic evidence smoke checks passed. No external data was read or written.")
+
+
+# Reversing precedence must change the winner where both strategies can resolve.
+reverse = {"resolve": {
+    "sales_rep_e_email": {"strategies": ["sales_rep_company_owner", "sales_rep_order_native"]},
+    "company_e_id": meta["resolve"]["company_e_id"],
+}}
+reverse_rows = {r.orders_e_id: r.asDict() for r in run_resolve(orders, reverse, ctx).collect()}
+assert reverse_rows["r1"]["sales_rep_e_email"] == "owner@example.test"
+assert len(json.loads(reverse_rows["r1"]["sales_rep_e_email_evidence"])["attempts"]) == 1
+
+# Null and whitespace native values must fall through, custom target/params work.
+blank = orders.limit(1).withColumn("alternate_rep", lit("  "))
+custom = run_resolve(blank, {"resolve": {"custom_assignment": {"strategies": [
+    {"id": "blank", "strategy": "sales_rep_order_native", "params": {"field": "alternate_rep"}},
+    {"id": "native", "strategy": "sales_rep_order_native"}
+]}}}, ctx).first().asDict()
+assert custom["custom_assignment"] == "direct@example.test"
+
+# Conflicting company matches cannot duplicate rows or silently pick an owner.
+ambiguous = companies.unionByName(spark.createDataFrame(
+    [("c3", "Acme", "o2", "hubspot")], companies.schema))
+try:
+    run_resolve(orders, meta, {**ctx, "dims": {**ctx["dims"], "companies": ambiguous}})
+except ValueError as exc:
+    assert "ambiguous" in str(exc)
+else:
+    raise AssertionError("Conflicting matches must fail")
+print("Composable resolver smoke checks passed.")
