@@ -357,6 +357,33 @@ def d_is_not_null(df, d, ctx):
     """Boolean flag: true when `of` (a column) is non-null. The in_hubspot flag."""
     return col(d["of"]).isNotNull()
 
+@derive_strategy(
+    "new_or_returning",
+    description=(
+        "Classifies an order from its customer lifetime order sequence. "
+        "Sequence 1 is New; sequences greater than 1 are Returning. "
+        "Missing or invalid sequences are Unknown. "
+        "New means the customer's first observed order in the available "
+        "history, not necessarily their first-ever purchase."
+    ),
+    outcomes={}
+)
+def d_new_or_returning(df, d, ctx):
+    """Classify an order using the sequence column named in `of`."""
+    sequence = col(d["of"])
+
+    valid = (
+        sequence.isNotNull()
+        & (sequence >= 1)
+        & (sequence == sequence.cast("long"))
+    )
+
+    return (
+        when(~valid | sequence.isNull(), lit("Unknown"))
+        .when(sequence == 1, lit("New"))
+        .otherwise(lit("Returning"))
+    )
+
 # COMMAND ----------
 
 print("Gold strategies loaded and registered.")
