@@ -1,5 +1,10 @@
 # Composable gold resolution and evidence
 
+> Dedup update: the current build requires Supabase configuration schema version 2,
+> including a dedup policy for every table. See [DEDUP.md](DEDUP.md) for the current
+> configuration, audit contract and deployment steps. The resolver-only v1 rollout
+> described below is historical and must not be used with the new build.
+
 ## Ownership
 
 Supabase's existing `client_configs_by_slug.resolution_config` is now the complete

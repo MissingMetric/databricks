@@ -93,6 +93,11 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
     # Definitions are passed from the same registry that executes the strategies.
     # Never infer the applied strategy from the authored catalog prose.
     strategies = strategies if strategies is not None else globals().get("STRATEGY_DEFINITIONS", {})
+    strategies = copy.deepcopy(strategies)
+    for name, description in {**DEDUP_DEFINITIONS, "pipeline": "Applies client-owned matching, conflict and survivor policies; preserves source records and aliases in the run audit."}.items():
+        ref = f"dedup.{name}@1"
+        strategies[ref] = {"id": ref, "name": name, "stage": "dedup", "version": 1,
+                          "description": description, "outcomes": {"retained": "This is a retained reporting record; inspect the run audit for exclusions and conflicts."}}
     used = set()
 
     def reference(stage, name):
@@ -182,8 +187,10 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         cat["record_fields"] = allowed
         dedup = meta.get("dedup")
         if dedup:
-            cat["row_provenance"] = {"strategies": [reference("dedup", dedup.get("strategy", "keep_first"))],
-                "evidence": {"source_column": "__mm_dedup_source", "column": "__mm_dedup_evidence"}}
+            cat["row_provenance"] = {"strategies": [reference("dedup", "none" if dedup["strategies"][0]["strategy"] == "none" else "pipeline")],
+                "evidence": {"source_column": "__mm_dedup_source", "column": "__mm_dedup_evidence"},
+                "policy": copy.deepcopy(dedup), "identity_links": copy.deepcopy(meta.get("identity_links", [])),
+                "audit_path": f"audit/dedup/{run_id}/{name}" if dedup["strategies"][0]["strategy"] != "none" else None}
         out[name] = cat
     # Include all strategies actually configured, including non-exported stages,
     # once per client. Unused registered strategies are not published.
@@ -200,7 +207,8 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         for spec in tm.get("enrich", []):
             reference("enrich", spec.get("strategy", "left_join_bring"))
         if tm.get("dedup"):
-            reference("dedup", tm["dedup"].get("strategy", "keep_first"))
+            for step in tm["dedup"]["strategies"]:
+                reference("dedup", step["strategy"])
     return {"schema_version": 2, "run_id": run_id, "tables": out,
             "strategies": {k: copy.deepcopy(strategies[k]) for k in sorted(used)}}
 

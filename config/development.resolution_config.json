@@ -1,23 +1,146 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tables": {
-    "sales_reps": {"resolve": {}},
+    "sales_reps": {
+      "resolve": {},
+      "dedup": {
+        "identity": [
+          "source_platform",
+          "id"
+        ],
+        "scope": [
+          "source_platform"
+        ],
+        "allow_entity_merge": false,
+        "strategies": [
+          {
+            "strategy": "exact_record"
+          },
+          {
+            "strategy": "same_source_identity",
+            "params": {
+              "order_by": [
+                {
+                  "field": "modified_date",
+                  "direction": "desc"
+                }
+              ]
+            }
+          }
+        ],
+        "selection": {
+          "order_by": []
+        },
+        "conflict_fields": [],
+        "on_conflict": "fail"
+      }
+    },
     "companies": {
       "resolve": {
-        "sales_rep_e_email": {"strategies": ["owner_id_to_rep_email"]}
-      }
+        "sales_rep_e_email": {
+          "strategies": [
+            "owner_id_to_rep_email"
+          ]
+        }
+      },
+      "dedup": {
+        "identity": [
+          "source_platform",
+          "id"
+        ],
+        "scope": [
+          "source_platform"
+        ],
+        "allow_entity_merge": true,
+        "strategies": [
+          {
+            "strategy": "exact_record"
+          },
+          {
+            "strategy": "same_source_identity",
+            "params": {
+              "order_by": [
+                {
+                  "field": "modified_date",
+                  "direction": "desc"
+                }
+              ]
+            }
+          },
+          {
+            "id": "development_company_name",
+            "strategy": "unique_business_key",
+            "params": {
+              "keys": [
+                {
+                  "field": "name",
+                  "normalize": "company_name"
+                }
+              ]
+            },
+            "action": "merge"
+          }
+        ],
+        "selection": {
+          "order_by": []
+        },
+        "conflict_fields": [
+          "owner_id"
+        ],
+        "on_conflict": "fail"
+      },
+      "identity_links": [
+        {
+          "field": "owner_id",
+          "table": "sales_reps",
+          "key": "id",
+          "scope": {
+            "source_platform": "source_platform"
+          }
+        }
+      ]
     },
     "orders": {
       "resolve": {
         "company_e_id": {
-          "strategies": ["company_normalized_name_match", "company_order_string"]
+          "strategies": [
+            "company_normalized_name_match",
+            "company_order_string"
+          ]
         },
         "sales_rep_e_email": {
-          "strategies": ["sales_rep_order_native"],
+          "strategies": [
+            "sales_rep_order_native"
+          ],
           "by_platform": {
-            "shopify": {"strategies": ["sales_rep_order_native", "sales_rep_company_owner"]}
+            "shopify": {
+              "strategies": [
+                "sales_rep_order_native",
+                "sales_rep_company_owner"
+              ]
+            }
           }
         }
+      },
+      "dedup": {
+        "identity": [
+          "source_platform",
+          "id"
+        ],
+        "scope": [
+          "source_platform"
+        ],
+        "allow_entity_merge": false,
+        "strategies": [
+          {
+            "strategy": "exact_record"
+          }
+        ],
+        "selection": {
+          "order_by": []
+        },
+        "conflict_fields": [],
+        "on_conflict": "fail"
       }
     }
   }

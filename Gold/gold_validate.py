@@ -93,16 +93,29 @@ def identity_columns(tmeta):
 def validate_gold(tables_meta, DEDUP, RESOLVE, METRIC, ENRICH, DERIVE):
     errors = []
 
+    if not isinstance(tables_meta, dict) or any(not isinstance(tm, dict) for tm in tables_meta.values()):
+        raise GoldMetaError("Expected table definitions, not a configuration envelope")
     # Pass 1: surfaces
-    surfaces = {name: compute_meta_surface(tm) for name, tm in tables_meta.items()}
+    surfaces = {name: compute_meta_surface({**tm, "_name": name}) for name, tm in tables_meta.items()}
 
     # Pass 2: per-table checks
     for name, tm in tables_meta.items():
 
-        # dedup strategy registered
-        d = tm.get("dedup", {})
-        if d and d.get("strategy") and d["strategy"] not in DEDUP:
-            errors.append(f"[{name}] dedup strategy '{d['strategy']}' not registered")
+        try:
+            validate_dedup(tm.get("dedup"), tm.get("base_columns", []) + ([tm["grain_pk"]] if tm.get("grain_pk") else []))
+            for link in tm.get("identity_links", []):
+                if set(link) != {"field", "table", "key", "scope"} or link["table"] not in tables_meta:
+                    raise ValueError("Invalid identity link")
+                other = tables_meta[link["table"]]
+                bindings = {**link["scope"], link["key"]: link["field"]}
+                if (set(bindings) != set(other["dedup"]["identity"])
+                        or not set(bindings.values()) <= set(tm.get("base_columns", []))
+                        or link["key"] in other["dedup"]["scope"]):
+                    raise ValueError("Identity links must bind complete scoped identities")
+                if other["dedup"]["strategies"][0]["strategy"] == "none":
+                    raise ValueError("Identity-link targets require a dedup mapping, not none")
+        except (ValueError, KeyError, TypeError) as exc:
+            errors.append(f"[{name}] {exc}")
 
         try:
             resolver_order(tm.get("resolve", {}), RESOLVE,
