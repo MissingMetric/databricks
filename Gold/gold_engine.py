@@ -36,6 +36,8 @@ from pyspark.sql.functions import col, lit, row_number, struct, to_json, array, 
 # COMMAND ----------
 # MAGIC %run ./gold_resolver_config
 # COMMAND ----------
+# MAGIC %run ./gold_dedup
+# COMMAND ----------
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -139,16 +141,7 @@ def prefix_native(df: DataFrame, table_meta: dict) -> DataFrame:
 
 
 def run_dedup(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
-    spec = table_meta.get("dedup")
-    if not spec:
-        return df
-    strat = spec.get("strategy", "keep_first")
-    result = DEDUP[strat](df, spec, ctx)
-    # Dedup records the surviving row, not discarded candidate rows.
-    inputs = {k: col(spec[k]) for k in ("on", "order_by") if spec.get(k)}
-    result = result.withColumn("__mm_dedup", lit("retained"))
-    return record_evidence(result, "__mm_dedup", DEDUP[strat].strategy_ref,
-        lit("retained"), inputs, ctx).drop("__mm_dedup")
+    return run_dedup_pipeline(df, table_meta, ctx)
 
 
 def run_resolve(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
@@ -321,12 +314,12 @@ def run_gold(tables_meta: dict, load_fn, ctx: dict) -> dict:
     # matters: every dedup is done before any resolve begins.
     for name in names:
         base = load_fn(tables_meta[name])
-        deduped = run_dedup(base, tables_meta[name], ctx)
-        # tell prefix_native the table name so `entity` can default to it
-        meta_with_name = dict(tables_meta[name])
-        meta_with_name.setdefault("_name", name)
-        frames[name] = prefix_native(deduped, meta_with_name)
-        print(f"  [1 dedup+prefix] {name}: native cols -> {name}_e_*")
+        frames[name] = run_dedup(base, {**tables_meta[name], "_name": name}, ctx)
+    # Apply foreign-ID aliases only after ALL canonical mappings are available.
+    for name in names:
+        linked = apply_identity_links(frames[name], tables_meta[name], tables_meta, ctx)
+        frames[name] = prefix_native(linked, {**tables_meta[name], "_name": name})
+        print(f"  [1 dedup+prefix] {name}")
 
     # publish deduped (and native-prefixed) dimensions for the resolvers
     ctx["dims"] = dict(frames)

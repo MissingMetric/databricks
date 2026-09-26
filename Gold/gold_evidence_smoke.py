@@ -60,7 +60,8 @@ metrics = run_metrics(resolved, {"metrics": [{"name": "total", "agg": "sum", "of
 assert json.loads(metrics.filter("orders_e_id = 'r2'").first().total_evidence)["result"] == 70
 derived = run_derive(metrics, {"derive": [{"name": "has_rep", "expr": "is_not_null", "of": "sales_rep_e_email"}]}, ctx)
 assert json.loads(derived.filter("orders_e_id = 'r3'").first().has_rep_evidence)["result"] is False
-deduped = run_dedup(orders, {"dedup": {"strategy": "none"}}, ctx)
+deduped = run_dedup(orders, {"dedup": {"identity": ["source_platform", "orders_e_id"],
+    "scope": ["source_platform"], "strategies": [{"strategy": "none"}]}}, ctx)
 assert "__mm_dedup_evidence" in deduped.columns
 print("Synthetic evidence smoke checks passed. No external data was read or written.")
 

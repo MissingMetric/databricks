@@ -6,6 +6,10 @@ import unittest
 spec = importlib.util.spec_from_file_location('config', Path(__file__).resolve().parents[1] / 'Gold/gold_resolver_config.py')
 config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
+dedup_spec = importlib.util.spec_from_file_location('dedup', Path(__file__).resolve().parents[1] / 'Gold/gold_dedup_config.py')
+dedup = importlib.util.module_from_spec(dedup_spec)
+dedup_spec.loader.exec_module(dedup)
+config.validate_dedup = dedup.validate_dedup
 
 
 class ResolverConfigTests(unittest.TestCase):
@@ -34,11 +38,11 @@ class ResolverConfigTests(unittest.TestCase):
                 config.resolver_order({'target': {'strategies': chain}}, registry, [])
 
     def test_client_config_replaces_never_merges(self):
-        tables = {'orders': {'resolve': {'old': {'strategy': 'legacy'}}, 'base_columns': ['x']}}
-        result = config.client_resolver_tables(tables, {'schema_version': 1, 'tables': {'orders': {'resolve': {}}}})
+        tables = {'orders': {'resolve': {'old': {'strategy': 'legacy'}}, 'base_columns': ['source_platform', 'id']}}
+        result = config.client_resolver_tables(tables, {'schema_version': 2, 'tables': {'orders': {'resolve': {}, 'dedup': {'identity': ['source_platform', 'id'], 'scope': ['source_platform'], 'strategies': [{'strategy': 'none'}]}}}})
         self.assertEqual(result['orders']['resolve'], {})
         self.assertIn('old', tables['orders']['resolve'])
-        self.assertEqual(result['orders']['base_columns'], ['x'])
+        self.assertEqual(result['orders']['base_columns'], ['source_platform', 'id'])
         for bad in ({}, {'schema_version': 1, 'tables': {}}):
             with self.assertRaises(ValueError):
                 config.client_resolver_tables(tables, bad)

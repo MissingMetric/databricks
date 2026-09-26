@@ -13,6 +13,11 @@ spec.loader.exec_module(catalog)
 config_spec = importlib.util.spec_from_file_location("resolver_config", ROOT / "Gold/gold_resolver_config.py")
 config = importlib.util.module_from_spec(config_spec)
 config_spec.loader.exec_module(config)
+dedup_spec = importlib.util.spec_from_file_location("dedup_config", ROOT / "Gold/gold_dedup_config.py")
+dedup_config = importlib.util.module_from_spec(dedup_spec)
+dedup_spec.loader.exec_module(dedup_config)
+config.validate_dedup = dedup_config.validate_dedup
+catalog.DEDUP_DEFINITIONS = dedup_config.DEDUP_DEFINITIONS
 catalog.resolver_variants = config.resolver_variants
 
 
@@ -84,6 +89,15 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Missing generated evidence"):
             catalog.build_full_catalog(self.meta, self.registry, schema_columns={"orders": []})
 
+    def test_dedup_catalog_publishes_policy_and_used_definitions_only(self):
+        document = self.build()
+        provenance = document['tables']['companies']['row_provenance']
+        self.assertEqual(provenance['policy']['conflict_fields'], ['owner_id'])
+        self.assertEqual(provenance['evidence']['column'], '__mm_dedup_evidence')
+        self.assertIn('dedup.unique_business_key@1', document['strategies'])
+        self.assertNotIn('dedup.external_reference@1', document['strategies'])
+        self.assertNotIn('dedup.keep_first@1', document['strategies'])
+
     def test_gold_files_are_valid_python(self):
         for path in (ROOT / "Gold").glob("*.py"):
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -93,6 +107,7 @@ class CatalogTests(unittest.TestCase):
         validator = importlib.util.module_from_spec(module_spec)
         module_spec.loader.exec_module(validator)
         validator.resolver_order = config.resolver_order
+        validator.validate_dedup = dedup_config.validate_dedup
         registries = {stage: {} for stage in ("dedup", "resolve", "metric", "enrich", "derive")}
         for definition in self.registry.values():
             inputs = {k: v["default_field"] for k, v in definition.get("inputs", {}).items()}

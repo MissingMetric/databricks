@@ -40,24 +40,8 @@ def company_match_key(c):
 # STAGE 1 -- DEDUP strategies
 # ══════════════════════════════════════════════════════════════════════════════
 
-@dedup_strategy("none",
-    description="Keeps all incoming rows; no deduplication is applied.",
-    outcomes={"retained":"This row was retained without deduplication."})
-def dedup_none(df, spec, ctx):
-    """No dedup -- table is already at its own grain."""
-    return df
-
-
-@dedup_strategy("keep_first",
-    description="Keeps one row per identity, ordered descending by the configured ordering field. Ties have no explicit preference.",
-    outcomes={"retained":"This is the retained row. Discarded candidates are not stored in this evidence."})
-def dedup_keep_first(df, spec, ctx):
-    """One row per `on` key, deterministic pick by optional `order_by` (desc)."""
-    on = spec["on"]
-    order_col = spec.get("order_by", on)
-    w = Window.partitionBy(on).orderBy(col(order_col).desc())
-    return (df.withColumn("_rn", row_number().over(w))
-              .filter(col("_rn") == 1).drop("_rn"))
+# Dedup policies and matchers now live in gold_dedup_config / gold_dedup.
+# The old keep_first implementation is intentionally no longer registered.
 
 # COMMAND ----------
 
@@ -107,16 +91,24 @@ def r_company_order_string(df, params, ctx):
     outcomes={"company_name_match": "A unique normalized-name match supplied the company identity.",
               "missing_input_or_match": "No usable company name or directory match was found."})
 def r_company_normalized_name_match(df, params, ctx):
-    lookup = _unique_lookup(ctx["dims"]["companies"].withColumn(
+    companies = ctx["dims"]["companies"]
+    fields = ["company_e_id", "company_e_name", "source_platform"]
+    has_dedup = "__mm_dedup_evidence" in companies.columns
+    if has_dedup:
+        fields.append("__mm_dedup_evidence")
+    lookup = _unique_lookup(companies.withColumn(
         "__mm_name", company_match_key(col("company_e_name"))),
-        "__mm_name", ["company_e_id", "company_e_name", "source_platform"])
+        "__mm_name", fields)
     key = company_match_key(col(params["field"]))
     joined = df.join(lookup, (key != "") & (key == col("__mm_lookup_key")), "left")
-    result = _candidate(joined, col("__mm_lookup_company_e_id"), "company_name_match", {
+    inputs = {
         "order_company": col(params["field"]), "normalized_name": key,
         "matched_company_id": col("__mm_lookup_company_e_id"),
         "matched_company_name": col("__mm_lookup_company_e_name"),
-        "matched_platform": col("__mm_lookup_source_platform")},
+        "matched_platform": col("__mm_lookup_source_platform")}
+    if has_dedup:
+        inputs["company_dedup_decision"] = col("__mm_lookup___mm_dedup_evidence")
+    result = _candidate(joined, col("__mm_lookup_company_e_id"), "company_name_match", inputs,
         col("__mm_ambiguous"))
     return result.drop(*lookup.columns)
 
@@ -368,7 +360,7 @@ def d_is_not_null(df, d, ctx):
 # COMMAND ----------
 
 print("Gold strategies loaded and registered.")
-print(f"  dedup:   {sorted(DEDUP)}")
+print(f"  dedup policies: {sorted(DEDUP_DEFINITIONS)}")
 print(f"  resolve: {sorted(RESOLVE)}")
 print(f"  metric:  {sorted(METRIC)}")
 print(f"  enrich:  {sorted(ENRICH)}")

@@ -2,6 +2,10 @@
 """Pure configuration contract shared by validation, execution and cataloging."""
 from copy import deepcopy
 
+# COMMAND ----------
+# MAGIC %run ./gold_dedup_config
+# COMMAND ----------
+
 
 def resolver_steps(spec):
     if not isinstance(spec, dict) or set(spec) - {"strategies", "by_platform"}:
@@ -76,16 +80,19 @@ def resolver_order(resolvers, registry, available):
 
 def client_resolver_tables(tables, config):
     """Exact replacement, never an overlay. Every table must be acknowledged."""
-    if not isinstance(config, dict) or set(config) != {"schema_version", "tables"} or config["schema_version"] != 1:
-        raise ValueError("resolution_config requires schema_version=1 and tables")
+    if not isinstance(config, dict) or set(config) != {"schema_version", "tables"} or config["schema_version"] != 2:
+        raise ValueError("resolution_config requires schema_version=2 and tables")
     client_tables = config["tables"]
     if not isinstance(client_tables, dict) or set(client_tables) != set(tables):
         raise ValueError("Client resolver configuration must explicitly cover every gold table (use resolve: {} when empty)")
     result = deepcopy(tables)
     for name, entry in client_tables.items():
-        if not isinstance(entry, dict) or set(entry) != {"resolve"} or not isinstance(entry["resolve"], dict):
-            raise ValueError(f"{name}: expected a resolve object")
+        if not isinstance(entry, dict) or not {"resolve", "dedup"} <= set(entry) or set(entry) - {"resolve", "dedup", "identity_links"} or not isinstance(entry["resolve"], dict):
+            raise ValueError(f"{name}: expected resolve and dedup objects, optional identity_links")
         for spec in entry["resolve"].values():
             resolver_variants(spec)
+        validate_dedup(entry["dedup"], tables[name].get("base_columns", []) + ([tables[name]["grain_pk"]] if tables[name].get("grain_pk") else []))
         result[name]["resolve"] = deepcopy(entry["resolve"])
+        result[name]["dedup"] = deepcopy(entry["dedup"])
+        result[name]["identity_links"] = deepcopy(entry.get("identity_links", []))
     return result

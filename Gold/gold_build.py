@@ -83,11 +83,11 @@ def fetch_client_resolution(slug):
 
 # COMMAND ----------
 
-# Shared metadata describes structure. Supabase owns ALL resolver chains.
+# Shared metadata describes structure. Supabase owns resolver and dedup policies.
 gold_meta = download_json(config_path("Gold/gold_tables.json"))
 tables_meta = {k: v for k, v in gold_meta.items() if not k.startswith("_")}
 tables_meta = client_resolver_tables(tables_meta, fetch_client_resolution(slug))
-print("Loaded complete client resolver configuration (no defaults or deep merge)")
+print("Loaded complete client resolver/dedup configuration (no defaults or deep merge)")
 
 # COMMAND ----------
 
@@ -236,6 +236,14 @@ written, internal = [], []
 # Fail before replacing any data if generated evidence and metadata disagree.
 build_full_catalog(tables_meta, strategies=STRATEGY_DEFINITIONS,
                    schema_columns={name: df.columns for name, df in results.items()}, run_id=ctx["run_id"])
+# Full original payloads remain in an internal, run-scoped audit area, NOT gold
+# tables exposed by the API. Write audits first so exclusions are traceable.
+for name, artifacts in ctx.get("dedup_audits", {}).items():
+    for kind, audit in artifacts.items():
+        path = f"abfss://{slug}@{storage_account}.dfs.core.windows.net/audit/dedup/{ctx['run_id']}/{name}/{kind}"
+        audit.write.mode("errorifexists").parquet(path)
+    ctx["dedup_aliases"][name].write.mode("errorifexists").parquet(
+        f"abfss://{slug}@{storage_account}.dfs.core.windows.net/audit/dedup/{ctx['run_id']}/{name}/aliases")
 for name, df in results.items():
     if tables_meta[name].get("export", True):
         df.write.mode("overwrite").parquet(gold_path(name).rstrip("/"))
