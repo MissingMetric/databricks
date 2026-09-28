@@ -31,6 +31,7 @@
 # COMMAND ----------
 
 from pyspark.sql import DataFrame, Window
+from pyspark.sql import functions as F
 from pyspark.sql.functions import col, lit, row_number, struct, to_json, array, concat, when
 
 # COMMAND ----------
@@ -44,6 +45,7 @@ from uuid import uuid4
 # ── The four registries ──────────────────────────────────────────────────────
 
 DEDUP    = {}   # name -> fn(df, spec, ctx) -> df
+SELECTION = {}  # registered selectors; not a new pipeline stage
 RESOLVE  = {}   # name -> fn(df, spec, ctx) -> df   (adds identity/measure cols + *_source)
 METRIC   = {}   # name -> fn(df, spec, ctx) -> Column   (one aggregated column)
 ENRICH   = {}   # name -> fn(df, source_surface_df, spec, ctx) -> df
@@ -56,7 +58,7 @@ def _reg(registry, name, description, outcomes=None, inputs=None, version=1):
         if name in registry:
             raise ValueError(f"{name} already registered")
         registry[name] = fn
-        stage = next(k for k, v in {"dedup": DEDUP, "resolve": RESOLVE,
+        stage = next(k for k, v in {"dedup": DEDUP, "selection": SELECTION, "resolve": RESOLVE,
             "metric": METRIC, "enrich": ENRICH, "derive": DERIVE}.items() if v is registry)
         ref = f"{stage}.{name}@{version}"
         fn.strategy_ref = ref
@@ -67,6 +69,7 @@ def _reg(registry, name, description, outcomes=None, inputs=None, version=1):
     return _wrap
 
 def dedup_strategy(name, **definition): return _reg(DEDUP, name, **definition)
+def selection_strategy(name, **definition): return _reg(SELECTION, name, **definition)
 def resolve_strategy(name, row_inputs=None, **definition):
     def register(fn):
         fn.row_inputs = row_inputs or {}
@@ -142,6 +145,8 @@ def run_dedup(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     spec = table_meta.get("dedup")
     if not spec:
         return df
+    if "strategies" in spec:
+        return _run_registered_dedup(df, table_meta, ctx)
     strat = spec.get("strategy", "keep_first")
     result = DEDUP[strat](df, spec, ctx)
     # Dedup records the surviving row, not discarded candidate rows.
@@ -149,6 +154,141 @@ def run_dedup(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
     result = result.withColumn("__mm_dedup", lit("retained"))
     return record_evidence(result, "__mm_dedup", DEDUP[strat].strategy_ref,
         lit("retained"), inputs, ctx).drop("__mm_dedup")
+
+
+def dedup_json(fields):
+    """Typed, null-preserving identity encoding; never concatenate delimiters."""
+    return F.to_json(F.struct(*[F.col(k).alias(k) for k in fields]),
+                     {"ignoreNullFields": "false"})
+
+
+def dedup_require(condition, df, message):
+    if df.filter(condition).limit(1).count():
+        raise ValueError(message)
+
+
+def _run_registered_dedup(df, table_meta, ctx):
+    """Matchers annotate every input row; selectors annotate a winning member.
+
+    No business strategy dispatch here. Decisions are captured BEFORE filtering.
+    Whole-unit selection is possible because member identity is independent of
+    physical row identity. Exact repeated payloads have an occurrence count.
+    """
+    spec = table_meta["dedup"]
+    validate_dedup_steps(spec, df.columns, DEDUP, SELECTION)
+    if any(c.startswith("__dd_") for c in df.columns):
+        raise ValueError("Reserved __dd_ input column")
+    native = df.columns
+    for key in spec["identity"]:
+        dedup_require(F.col(key).isNull() | (F.trim(F.col(key).cast("string")) == ""),
+                      df, f"Missing dedup identity: {key}")
+    rows = (df.withColumn("__dd_record", dedup_json(sorted(native)))
+        .groupBy(*native, "__dd_record").agg(F.count("*").alias("__dd_occurrences"))
+        .withColumn("__dd_identity", dedup_json(spec["identity"]))
+        .withColumn("__dd_history", F.array().cast("array<string>")))
+    audits = []
+    aliases = {}
+    local_ctx = {**ctx, "dedup_identity": spec["identity"]}
+    for step in spec["strategies"]:
+        matcher, selector = DEDUP[step["strategy"]], SELECTION[step["selection"]["strategy"]]
+        before = rows.columns
+        matched = matcher(rows, step.get("params", {}), local_ctx)
+        required = {"__dd_group", "__dd_member", "__dd_role", "__dd_inputs"}
+        if set(matched.columns) != set(before) | required:
+            raise ValueError(f"{step['id']}: invalid matcher columns")
+        original = matched.select(*before)
+        if original.exceptAll(rows).limit(1).count() or rows.exceptAll(original).limit(1).count():
+            raise ValueError(f"{step['id']}: matcher changed input rows")
+        dedup_require(F.col("__dd_member").isNull() | F.col("__dd_inputs").isNull(),
+                      matched, "Matcher omitted identity/evidence")
+        # A member (e.g. all lines of one order) must belong to exactly one group.
+        assignments = matched.groupBy("__dd_member").agg(
+            F.countDistinct(F.to_json(F.struct("__dd_group"), {"ignoreNullFields": "false"})).alias("n"))
+        dedup_require(F.col("n") > 1, assignments, "Member assigned to conflicting groups")
+        selected = selector(matched, step["selection"].get("params", {}), local_ctx)
+        if set(selected.columns) != set(matched.columns) | {"__dd_winner", "__dd_selection"}:
+            raise ValueError("Invalid selector columns")
+        original = selected.select(*matched.columns)
+        if original.exceptAll(matched).limit(1).count() or matched.exceptAll(original).limit(1).count():
+            raise ValueError("Selector changed input rows")
+        window = Window.partitionBy("__dd_group")
+        # Null groups are unmatched and never excluded.
+        selected = selected.withColumn("__dd_valid_winner", F.max(F.when(
+            F.col("__dd_member") == F.col("__dd_winner"), 1).otherwise(0)).over(window))
+        checks = selected.filter(F.col("__dd_group").isNotNull()).groupBy("__dd_group").agg(
+            F.countDistinct("__dd_winner").alias("n"), F.min("__dd_valid_winner").alias("valid"))
+        dedup_require((F.col("n") != 1) | (F.col("valid") != 1), checks, "Invalid selection winner")
+        dedup_require(F.col("__dd_winner").isNull() | F.col("__dd_selection").isNull(), selected,
+                      "Selector omitted winner/evidence")
+        decision = F.to_json(F.struct(
+            F.lit(ctx["run_id"]).alias("run_id"), F.lit(step["id"]).alias("step"),
+            F.lit(matcher.strategy_ref).alias("strategy"), F.lit(selector.strategy_ref).alias("selection_strategy"),
+            F.col("__dd_group").alias("group_id"), F.col("__dd_member").alias("member_id"),
+            F.col("__dd_winner").alias("winner_id"), F.col("__dd_inputs").alias("match_inputs"),
+            F.col("__dd_selection").alias("selection_inputs")), {"ignoreNullFields": "false"})
+        selected = selected.withColumn("__dd_decision", decision)
+        kept = F.col("__dd_group").isNull() | (F.col("__dd_member") == F.col("__dd_winner"))
+        if hasattr(matcher, "identity_mapping"):
+            fields = tuple(matcher.identity_mapping(step.get("params", {}), spec["identity"]))
+            mapping = selected.select(F.col("__dd_member").alias("source_identity"),
+                F.when(F.col("__dd_group").isNull(), F.col("__dd_member")).otherwise(F.col("__dd_winner")).alias("canonical_identity")).distinct()
+            if fields in aliases:
+                # Fresh right-hand attribute names avoid checkpoint self-join conflicts.
+                previous = aliases[fields]
+                right = mapping.select(F.col("source_identity").alias("__dd_next_source"),
+                    F.col("canonical_identity").alias("__dd_next_target"))
+                updated = previous.join(right, previous.canonical_identity == right.__dd_next_source, "left").select(
+                    previous.source_identity, F.coalesce(F.col("__dd_next_target"), previous.canonical_identity).alias("canonical_identity"))
+                mapping = updated.unionByName(mapping).distinct()
+            aliases[fields] = mapping
+        audits.append(selected.select(F.lit(step["id"]).alias("step"),
+            "__dd_identity", "__dd_record", "__dd_occurrences", "__dd_decision",
+            F.when(kept, "retained").otherwise("excluded").alias("outcome")))
+        rows = (selected.filter(kept)
+            .withColumn("__dd_history", F.concat("__dd_history", F.array("__dd_decision")))
+            .select(*before))
+    # A UUID cannot cure a violated business grain: fail instead.
+    duplicates = rows.groupBy("__dd_identity").count()
+    dedup_require(F.col("count") > 1, duplicates, "Dedup left multiple versions of the declared row identity")
+    audit = audits[0]
+    for part in audits[1:]:
+        audit = audit.unionByName(part)
+    name = table_meta.get("_name", table_meta.get("entity"))
+    ctx.setdefault("dedup_audits", {})[name] = audit
+    ctx.setdefault("dedup_aliases", {})[name] = aliases
+    return (rows.withColumn("__mm_dedup_source", F.lit("retained"))
+        .withColumn("__mm_dedup_evidence", F.to_json(F.struct(
+            F.lit(ctx["run_id"]).alias("run_id"), F.lit(name).alias("table"),
+            F.col("__dd_identity").alias("identity"), F.col("__dd_history").alias("steps"),
+            F.col("__dd_occurrences").alias("identical_occurrences"))))
+        .select(*native, "__mm_dedup_source", "__mm_dedup_evidence"))
+
+
+def lookup_dedup_alias(df, ctx, table, field_mapping, output="__mm_canonical_identity"):
+    """Explicit resolver helper, never an automatic foreign-key rewrite.
+
+    field_mapping maps target's bare identity fields to referencing-row fields.
+    Returns canonical identity JSON (or the original identity when unmatched).
+    Strategies can extract a component with get_json_object and record evidence.
+    """
+    keys = tuple(field_mapping)
+    available = ctx.get("dedup_aliases", {}).get(table, {})
+    if available:
+        keys = next((grain for grain in available if set(grain) == set(field_mapping)), None)
+        if keys is None:
+            raise ValueError("Alias lookup must provide the complete configured identity grain")
+    mapping = available.get(keys)
+    original = F.to_json(F.struct(*[F.col(field_mapping[key]).alias(key) for key in keys]),
+                         {"ignoreNullFields": "false"})
+    if mapping is None:
+        return df.withColumn(output, original)
+    if output in df.columns or {"__dd_lookup_source", "__dd_lookup_target"} & set(df.columns):
+        raise ValueError("Alias lookup output/scratch collision")
+    right = mapping.select(F.col("source_identity").alias("__dd_lookup_source"),
+                           F.col("canonical_identity").alias("__dd_lookup_target"))
+    return (df.join(right, original == F.col("__dd_lookup_source"), "left")
+        .withColumn(output, F.coalesce(F.col("__dd_lookup_target"), original))
+        .drop("__dd_lookup_source", "__dd_lookup_target"))
 
 
 def run_resolve(df: DataFrame, table_meta: dict, ctx: dict) -> DataFrame:
@@ -321,7 +461,7 @@ def run_gold(tables_meta: dict, load_fn, ctx: dict) -> dict:
     # matters: every dedup is done before any resolve begins.
     for name in names:
         base = load_fn(tables_meta[name])
-        deduped = run_dedup(base, tables_meta[name], ctx)
+        deduped = run_dedup(base, {**tables_meta[name], "_name": name}, ctx)
         # tell prefix_native the table name so `entity` can default to it
         meta_with_name = dict(tables_meta[name])
         meta_with_name.setdefault("_name", name)

@@ -90,7 +90,7 @@ def identity_columns(tmeta):
     return ids
 
 
-def validate_gold(tables_meta, DEDUP, RESOLVE, METRIC, ENRICH, DERIVE):
+def validate_gold(tables_meta, DEDUP, RESOLVE, METRIC, ENRICH, DERIVE, SELECTION=None):
     errors = []
 
     # Pass 1: surfaces
@@ -101,6 +101,11 @@ def validate_gold(tables_meta, DEDUP, RESOLVE, METRIC, ENRICH, DERIVE):
 
         # dedup strategy registered
         d = tm.get("dedup", {})
+        if "strategies" in d:
+            try:
+                validate_dedup_steps(d, tm.get("base_columns", []), DEDUP, SELECTION or globals().get("SELECTION", {}))
+            except ValueError as exc:
+                errors.append(f"[{name}] {exc}")
         if d and d.get("strategy") and d["strategy"] not in DEDUP:
             errors.append(f"[{name}] dedup strategy '{d['strategy']}' not registered")
 

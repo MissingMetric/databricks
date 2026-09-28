@@ -40,6 +40,193 @@ def company_match_key(c):
 # STAGE 1 -- DEDUP strategies
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _dd_fields(keys, columns):
+    if not isinstance(keys, list) or not keys or any(not isinstance(k, str) or k not in columns for k in keys):
+        raise ValueError("Expected nonempty list of existing fields")
+
+
+def _dd_annotate(df, group, member, role, inputs):
+    return (df.withColumn("__dd_group", group).withColumn("__dd_member", member)
+        .withColumn("__dd_role", role).withColumn("__dd_inputs", inputs))
+
+
+@dedup_strategy("same_source_identity",
+    description="Groups versions of the same configured scoped source identity.", outcomes={})
+def match_same_source_identity(df, params, ctx):
+    return _dd_annotate(df, col("__dd_identity"), F.sha2(col("__dd_record"), 256), lit("version"),
+                        col("__dd_identity"))
+
+
+def _validate_same(params, columns, identity):
+    if params:
+        raise ValueError("same_source_identity accepts no parameters")
+
+
+match_same_source_identity.validate_params = _validate_same
+match_same_source_identity.selectors = {"ordered"}
+
+
+@dedup_strategy("normalized_key",
+    description="Matches complete normalized keys within a configured scope; protected-field disagreements stop the build. This is a client-approved equivalence rule, not fuzzy matching.", outcomes={})
+def match_normalized_key(df, params, ctx):
+    dedup_require(col("count") > 1, df.groupBy("__dd_identity").count(),
+                  "Resolve source versions before matching business keys")
+    expressions = [col(k).alias(k) for k in params["scope_by"]]
+    valid = lit(True)
+    for key in params["scope_by"]:
+        valid = valid & col(key).isNotNull() & (F.trim(col(key).cast("string")) != "")
+    for index, key in enumerate(params["keys"]):
+        value = col(key["field"])
+        norm = key.get("normalize", "exact")
+        if norm == "lower_trim":
+            value = F.lower(F.trim(value))
+        elif norm == "company_name":
+            value = company_match_key(value)
+        valid = valid & value.isNotNull() & (F.trim(value.cast("string")) != "")
+        expressions.append(value.alias(f"key_{index}"))
+    group = F.when(valid, F.to_json(F.struct(*expressions), {"ignoreNullFields": "false"}))
+    result = _dd_annotate(df, group, col("__dd_identity"), lit("candidate"),
+                         dedup_json(list(dict.fromkeys(params["scope_by"] + [k["field"] for k in params["keys"]] + params.get("must_agree", [])))))
+    for field in params.get("must_agree", []):
+        conflicts = result.filter(col("__dd_group").isNotNull()).groupBy("__dd_group").agg(
+            F.countDistinct(dedup_json([field])).alias("n"))
+        dedup_require(col("n") > 1, conflicts, f"Conflicting protected field: {field}")
+    return result
+
+
+def _validate_normalized(params, columns, identity):
+    if set(params) - {"scope_by", "keys", "require_nonempty", "must_agree"} or params.get("require_nonempty", True) is not True:
+        raise ValueError("normalized_key requires nonempty matching keys")
+    _dd_fields(params.get("scope_by"), columns)
+    if not isinstance(params.get("keys"), list) or not params["keys"]:
+        raise ValueError("normalized_key requires keys")
+    for key in params["keys"]:
+        if not isinstance(key, dict) or set(key) - {"field", "normalize"} or key.get("field") not in columns or key.get("normalize", "exact") not in {"exact", "lower_trim", "company_name"}:
+            raise ValueError("Invalid normalized matching key")
+    if not isinstance(params.get("must_agree", []), list):
+        raise ValueError("must_agree must be a list of fields")
+    if params.get("must_agree"):
+        _dd_fields(params["must_agree"], columns)
+
+
+match_normalized_key.validate_params = _validate_normalized
+match_normalized_key.selectors = {"ordered"}
+match_normalized_key.identity_mapping = lambda params, identity: identity
+
+
+@dedup_strategy("external_reference",
+    description="Matches one referencing unit to one existing referenced unit in explicit source scopes. All lines of each unit remain together; incomplete or conflicting links stop the build.", outcomes={})
+def match_external_reference(df, params, ctx):
+    unit = params["unit_by"]
+    source, target = params["from"], params["to"]
+    def scope(where):
+        condition = lit(True)
+        for key, value in where.items():
+            condition = condition & col(key).eqNullSafe(lit(value))
+        return condition
+    left_scope, right_scope = scope(source["where"]), scope(target["where"])
+    dedup_require(left_scope & right_scope, df, "External-reference scopes overlap")
+    for key in unit:
+        dedup_require((left_scope | right_scope) & (col(key).isNull() | (F.trim(col(key).cast("string")) == "")), df, "Missing external unit identity")
+    ref, target_key = source["reference_field"], target["identity_field"]
+    base = df.withColumn("__dd_unit", dedup_json(unit))
+    # Every line of a referencing unit must agree, including null versus value.
+    consistent = base.filter(left_scope).groupBy("__dd_unit").agg(F.countDistinct(dedup_json([ref])).alias("n"))
+    dedup_require(col("n") > 1, consistent, "Conflicting references within unit")
+    sources = base.filter(left_scope & col(ref).isNotNull() & (F.trim(col(ref).cast("string")) != "")).select(
+        col("__dd_unit").alias("__dd_from"), col(ref).cast("string").alias("__dd_ref")).distinct()
+    targets = base.filter(right_scope & col(target_key).isNotNull()).select(
+        col("__dd_unit").alias("__dd_to"), col(target_key).cast("string").alias("__dd_target")).distinct()
+    links = sources.join(targets, col("__dd_ref") == col("__dd_target"), "inner")
+    for field in ("__dd_from", "__dd_to"):
+        dedup_require(col("count") > 1, links.groupBy(field).count(), "External reference is not one-to-one")
+    members = links.select(col("__dd_from").alias("__dd_lookup"), col("__dd_to").alias("__dd_link"), lit("referencing").alias("__dd_kind"), col("__dd_ref").alias("__dd_link_input")).unionByName(
+        links.select(col("__dd_to").alias("__dd_lookup"), col("__dd_to").alias("__dd_link"), lit("referenced").alias("__dd_kind"), col("__dd_ref").alias("__dd_link_input")))
+    joined = base.join(members, col("__dd_unit") == col("__dd_lookup"), "left")
+    return _dd_annotate(joined, col("__dd_link"), col("__dd_unit"), F.coalesce(col("__dd_kind"), lit("unmatched")),
+        F.to_json(F.struct(col("__dd_link_input").alias("reference"), col("__dd_unit").alias("unit")), {"ignoreNullFields": "false"})).drop(
+            "__dd_unit", "__dd_lookup", "__dd_link", "__dd_kind", "__dd_link_input")
+
+
+def _validate_external(params, columns, identity):
+    if set(params) != {"unit_by", "from", "to", "cardinality"} or params["cardinality"] != "one_to_one":
+        raise ValueError("external_reference requires explicit units/scopes and one_to_one cardinality")
+    _dd_fields(params["unit_by"], columns)
+    if not set(params["unit_by"]) <= set(identity):
+        raise ValueError("Unit fields must be included in the row identity")
+    for side, key in (("from", "reference_field"), ("to", "identity_field")):
+        part = params[side]
+        if not isinstance(part, dict) or set(part) != {"where", key} or part[key] not in columns or not isinstance(part["where"], dict) or not part["where"]:
+            raise ValueError("Invalid external-reference endpoint")
+        _dd_fields(list(part["where"]), columns)
+        if not set(part["where"]) <= set(params["unit_by"]):
+            raise ValueError("Endpoint scope fields must be part of unit identity")
+        if any(v is None or isinstance(v, (dict, list)) for v in part["where"].values()):
+            raise ValueError("Source scopes require non-null scalar values")
+    if set(params["from"]["where"]) != set(params["to"]["where"]) or params["from"]["where"] == params["to"]["where"]:
+        raise ValueError("Endpoint scopes must bind the same fields to different values")
+
+
+match_external_reference.validate_params = _validate_external
+match_external_reference.selectors = {"referenced_record"}
+match_external_reference.identity_mapping = lambda params, identity: params["unit_by"]
+
+
+@selection_strategy("ordered",
+    description="Chooses by declared ordering and source preferences. Differing candidates tied at the top stop the build.", outcomes={})
+def select_ordered(df, params, ctx):
+    order = []
+    fields = []
+    for entry in params["order_by"]:
+        field = entry["field"]
+        fields.append(field)
+        value = col(field)
+        if "prefer" in entry:
+            value = lit(len(entry["prefer"]))
+            for index, preferred in reversed(list(enumerate(entry["prefer"]))):
+                value = F.when(col(field).eqNullSafe(lit(preferred)), index).otherwise(value)
+            order.append(value.asc())
+        else:
+            order.append(getattr(value, entry.get("direction", "asc") + "_nulls_" + entry.get("nulls", "last"))())
+    # Unmatched members get individual partitions, never compete with one another.
+    partition = F.coalesce(col("__dd_group"), col("__dd_member"))
+    window = Window.partitionBy(partition).orderBy(*order)
+    ranked = df.withColumn("__dd_rank", F.dense_rank().over(window))
+    ties = ranked.filter(col("__dd_rank") == 1).groupBy(partition.alias("partition")).agg(F.countDistinct("__dd_member").alias("n"))
+    dedup_require(col("n") > 1, ties, "Selection tied: configure an explicit tie-breaker")
+    full = window.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+    return (ranked.withColumn("__dd_winner", F.first("__dd_member").over(full))
+        .withColumn("__dd_selection", dedup_json(list(dict.fromkeys(fields)))).drop("__dd_rank"))
+
+
+def _validate_ordered(params, columns, identity):
+    if set(params) - {"order_by", "on_tie"} or params.get("on_tie", "fail") != "fail" or not isinstance(params.get("order_by"), list) or not params["order_by"]:
+        raise ValueError("ordered requires ordering; only on_tie=fail is supported")
+    for entry in params["order_by"]:
+        if not isinstance(entry, dict) or entry.get("field") not in columns:
+            raise ValueError("Invalid ordering field")
+        if "prefer" in entry:
+            if set(entry) - {"field", "prefer", "unlisted"} or not isinstance(entry["prefer"], list) or not entry["prefer"] or entry.get("unlisted", "last") != "last":
+                raise ValueError("Invalid preference ordering")
+            if any(not isinstance(v, str) for v in entry["prefer"]) or len(set(entry["prefer"])) != len(entry["prefer"]):
+                raise ValueError("Preferences must be distinct strings")
+        elif set(entry) - {"field", "direction", "nulls"} or entry.get("direction", "asc") not in {"asc", "desc"} or entry.get("nulls", "last") not in {"first", "last"}:
+            raise ValueError("Invalid ordering direction/null policy")
+
+
+select_ordered.validate_params = _validate_ordered
+
+
+@selection_strategy("referenced_record",
+    description="Keeps the existing referenced unit, including its entire line set, rather than its integration copy. Does not infer completeness.", outcomes={})
+def select_referenced_record(df, params, ctx):
+    winner = F.max(F.when(col("__dd_role") == "referenced", col("__dd_member"))).over(Window.partitionBy("__dd_group"))
+    return (df.withColumn("__dd_winner", F.when(col("__dd_group").isNull(), col("__dd_member")).otherwise(winner))
+        .withColumn("__dd_selection", F.to_json(F.struct(col("__dd_role").alias("role")))))
+
+
+select_referenced_record.validate_params = _validate_same
+
 @dedup_strategy("none",
     description="Keeps all incoming rows; no deduplication is applied.",
     outcomes={"retained":"This row was retained without deduplication."})

@@ -236,6 +236,27 @@ written, internal = [], []
 # Fail before replacing any data if generated evidence and metadata disagree.
 build_full_catalog(tables_meta, strategies=STRATEGY_DEFINITIONS,
                    schema_columns={name: df.columns for name, df in results.items()}, run_id=ctx["run_id"])
+# Audit snapshots must exist before any reporting output is replaced. They are
+# private client data, outside gold/ discovery; never expose these paths publicly.
+for name, audit in ctx.get("dedup_audits", {}).items():
+    audit_root = (
+        f"abfss://{slug}@{storage_account}.dfs.core.windows.net"
+        f"/audit/dedup/{ctx['run_id']}/{name}"
+    )
+
+    audit.write.mode("overwrite").parquet(
+        f"{audit_root}/decisions"
+    )
+
+    for index, (fields, mapping) in enumerate(
+        ctx.get("dedup_aliases", {}).get(name, {}).items()
+    ):
+        (
+            mapping
+            .withColumn("identity_fields", F.lit(json.dumps(fields)))
+            .write.mode("overwrite")
+            .parquet(f"{audit_root}/aliases_{index}")
+        )
 for name, df in results.items():
     if tables_meta[name].get("export", True):
         df.write.mode("overwrite").parquet(gold_path(name).rstrip("/"))

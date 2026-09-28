@@ -83,9 +83,55 @@ def client_resolver_tables(tables, config):
         raise ValueError("Client resolver configuration must explicitly cover every gold table (use resolve: {} when empty)")
     result = deepcopy(tables)
     for name, entry in client_tables.items():
-        if not isinstance(entry, dict) or set(entry) != {"resolve"} or not isinstance(entry["resolve"], dict):
+        if not isinstance(entry, dict) or "resolve" not in entry or set(entry) - {"resolve", "dedup"} or not isinstance(entry["resolve"], dict):
             raise ValueError(f"{name}: expected a resolve object")
         for spec in entry["resolve"].values():
             resolver_variants(spec)
         result[name]["resolve"] = deepcopy(entry["resolve"])
+        if "dedup" in entry:
+            result[name]["dedup"] = deepcopy(entry["dedup"])
     return result
+
+
+def validate_dedup_steps(spec, columns, matchers, selectors):
+    """Structure here; strategy-owned parameter validation stays on functions."""
+    if not isinstance(spec, dict) or not {"identity", "strategies"} <= set(spec) or set(spec) - {"identity", "strategies", "allow_identity_merge"}:
+        raise ValueError("dedup requires identity and strategies")
+    if not isinstance(spec.get("allow_identity_merge", False), bool):
+        raise ValueError("allow_identity_merge must be a boolean")
+    identity = spec["identity"]
+    if not isinstance(identity, list) or not identity or any(not isinstance(k, str) or k not in columns for k in identity) or len(set(identity)) != len(identity):
+        raise ValueError("dedup identity must be nonempty distinct existing columns")
+    steps = spec["strategies"]
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("dedup strategies must be a nonempty list")
+    ids = set()
+    mapping_grain = None
+    for step in steps:
+        if not isinstance(step, dict) or set(step) - {"id", "strategy", "params", "selection", "on_ambiguity"}:
+            raise ValueError("Invalid dedup step")
+        if not isinstance(step.get("id"), str) or not step["id"] or step["id"] in ids:
+            raise ValueError("Dedup step IDs must be unique and nonempty")
+        ids.add(step["id"])
+        if step.get("on_ambiguity", "fail") != "fail":
+            raise ValueError("Only fail-on-ambiguity is currently supported")
+        selection = step.get("selection")
+        if not isinstance(selection, dict) or set(selection) - {"strategy", "params"}:
+            raise ValueError("A dedup step requires selection")
+        for item, registry in ((step, matchers), (selection, selectors)):
+            fn = registry.get(item.get("strategy"))
+            if fn is None or not hasattr(fn, "validate_params"):
+                raise ValueError(f"Unregistered dedup/selection implementation: {item.get('strategy')}")
+            params = item.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError("Strategy params must be an object")
+            fn.validate_params(params, columns, identity)
+        if selection["strategy"] not in matchers[step["strategy"]].selectors:
+            raise ValueError("Matcher and selector are incompatible")
+        if hasattr(matchers[step["strategy"]], "identity_mapping") and not spec.get("allow_identity_merge", False):
+            raise ValueError("Cross-ID matching requires allow_identity_merge=true after auditing downstream references")
+        if hasattr(matchers[step["strategy"]], "identity_mapping"):
+            grain = tuple(matchers[step["strategy"]].identity_mapping(step.get("params", {}), identity))
+            if mapping_grain is not None and mapping_grain != grain:
+                raise ValueError("Cross-ID steps must use the same identity grain to preserve alias chains")
+            mapping_grain = grain

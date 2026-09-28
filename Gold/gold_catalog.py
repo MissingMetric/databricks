@@ -182,7 +182,12 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         cat["record_fields"] = allowed
         dedup = meta.get("dedup")
         if dedup:
-            cat["row_provenance"] = {"strategies": [reference("dedup", dedup.get("strategy", "keep_first"))],
+            steps = copy.deepcopy(dedup.get("strategies", []))
+            for step in steps:
+                step["strategy"] = reference("dedup", step["strategy"])
+                step["selection"]["strategy"] = reference("selection", step["selection"]["strategy"])
+            cat["row_provenance"] = {"strategies": [s["strategy"] for s in steps] if steps else [reference("dedup", dedup.get("strategy", "keep_first"))],
+                "dedup": {"identity": dedup.get("identity"), "steps": steps, "audit": {"run_id": run_id, "table": name}},
                 "evidence": {"source_column": "__mm_dedup_source", "column": "__mm_dedup_evidence"}}
         out[name] = cat
     # Include all strategies actually configured, including non-exported stages,
@@ -200,7 +205,12 @@ def build_full_catalog(tables_meta: dict, strategies=None, schema_columns=None, 
         for spec in tm.get("enrich", []):
             reference("enrich", spec.get("strategy", "left_join_bring"))
         if tm.get("dedup"):
-            reference("dedup", tm["dedup"].get("strategy", "keep_first"))
+            if "strategies" in tm["dedup"]:
+                for step in tm["dedup"]["strategies"]:
+                    reference("dedup", step["strategy"])
+                    reference("selection", step["selection"]["strategy"])
+            else:
+                reference("dedup", tm["dedup"].get("strategy", "keep_first"))
     return {"schema_version": 2, "run_id": run_id, "tables": out,
             "strategies": {k: copy.deepcopy(strategies[k]) for k in sorted(used)}}
 

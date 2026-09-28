@@ -80,6 +80,16 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.build()
 
+    def test_registered_dedup_and_selection_definitions(self):
+        self.meta["companies"]["dedup"] = {"identity": ["source_platform", "id"], "strategies": [
+            {"id": "latest", "strategy": "same_source_identity", "selection": {
+                "strategy": "ordered", "params": {"order_by": [{"field": "modified_date", "direction": "desc"}]}}}]}
+        doc = self.build()
+        self.assertIn("dedup.same_source_identity@1", doc["strategies"])
+        self.assertIn("selection.ordered@1", doc["strategies"])
+        self.assertNotIn("selection.referenced_record@1", doc["strategies"])
+        self.assertEqual(doc["tables"]["companies"]["row_provenance"]["dedup"]["steps"][0]["id"], "latest")
+
     def test_missing_exported_evidence_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "Missing generated evidence"):
             catalog.build_full_catalog(self.meta, self.registry, schema_columns={"orders": []})
@@ -95,6 +105,8 @@ class CatalogTests(unittest.TestCase):
         validator.resolver_order = config.resolver_order
         registries = {stage: {} for stage in ("dedup", "resolve", "metric", "enrich", "derive")}
         for definition in self.registry.values():
+            if definition["stage"] == "selection":
+                continue
             inputs = {k: v["default_field"] for k, v in definition.get("inputs", {}).items()}
             registries[definition["stage"]][definition["name"]] = SimpleNamespace(row_inputs=inputs)
         validator.validate_gold(self.meta, *registries.values())
