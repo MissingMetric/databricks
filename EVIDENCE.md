@@ -1,5 +1,9 @@
 # Composable gold resolution and evidence
 
+For registered dedup matching/selection, row-level decision audits and identity
+mapping, see [REGISTERED_DEDUP.md](REGISTERED_DEDUP.md). Resolver-chain behavior
+described below remains unchanged.
+
 ## Ownership
 
 Supabase's existing `client_configs_by_slug.resolution_config` is now the complete
