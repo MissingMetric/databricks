@@ -239,11 +239,24 @@ build_full_catalog(tables_meta, strategies=STRATEGY_DEFINITIONS,
 # Audit snapshots must exist before any reporting output is replaced. They are
 # private client data, outside gold/ discovery; never expose these paths publicly.
 for name, audit in ctx.get("dedup_audits", {}).items():
-    audit.write.mode("errorifexists").parquet(
-        f"abfss://{slug}@{storage_account}.dfs.core.windows.net/audit/dedup/{ctx['run_id']}/{name}/decisions")
-    for index, (fields, mapping) in enumerate(ctx.get("dedup_aliases", {}).get(name, {}).items()):
-        mapping.withColumn("identity_fields", F.lit(json.dumps(fields))).write.mode("errorifexists").parquet(
-            f"abfss://{slug}@{storage_account}.dfs.core.windows.net/audit/dedup/{ctx['run_id']}/{name}/aliases_{index}")
+    audit_root = (
+        f"abfss://{slug}@{storage_account}.dfs.core.windows.net"
+        f"/audit/dedup/{ctx['run_id']}/{name}"
+    )
+
+    audit.write.mode("overwrite").parquet(
+        f"{audit_root}/decisions"
+    )
+
+    for index, (fields, mapping) in enumerate(
+        ctx.get("dedup_aliases", {}).get(name, {}).items()
+    ):
+        (
+            mapping
+            .withColumn("identity_fields", F.lit(json.dumps(fields)))
+            .write.mode("overwrite")
+            .parquet(f"{audit_root}/aliases_{index}")
+        )
 for name, df in results.items():
     if tables_meta[name].get("export", True):
         df.write.mode("overwrite").parquet(gold_path(name).rstrip("/"))
